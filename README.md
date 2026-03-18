@@ -1,4 +1,4 @@
- * 1. Cloudflare多账号管理系统，本版本为修改版，原作者未知，十分抱歉。
+ * 1. Cloudflare多账号管理系统，本版本为修改版，https://t.me/yifang_chat
  * 2. 推荐workers部署。
  * 3. 推荐添加变量名称为大写的ACCESS_PASSWORD，建立访问密码。不设则不启用密码保护。
  * 4. 推荐建立任意名称KV空间。 绑定建立的KV空间，变量名为大写的CF_ACCOUNTS_KV，用来存储账号信息，不绑定则存储在本地浏览器。
