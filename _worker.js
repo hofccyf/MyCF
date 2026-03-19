@@ -1,6 +1,6 @@
 /**
  * Cloudflare Worker: MyCF
- * 1. Cloudflare多账号管理系统，本版本为修改版，原作者：   https://t.me/yifang_chat
+ * 1. Cloudflare多账号管理系统，本版本为修改版，原作者： https://t.me/yifang_chat
  * 2. 推荐workers部署。
  * 3. 推荐添加变量名称为大写的ACCESS_PASSWORD，建立访问密码。不设则不启用密码保护。
  * 4. 推荐建立任意名称KV空间。 绑定建立的KV空间，变量名为大写的CF_ACCOUNTS_KV，用来存储账号信息，不绑定则存储在本地浏览器。
@@ -857,7 +857,8 @@ input:checked + .slider:before{transform:translateX(16px)}
                     <label class="small" style="display:block;margin-top:12px">代码来源</label>
                     <select id="batchScriptSourceType" class="input" onchange="toggleBatchSourceInput()">
                         <option value="builtin">内置模板 (环境变量配置)</option>
-                        <option value="url">自定义链接 (URL)</option>
+                        <option value="url">远程链接 (URL)</option>
+                        <option value="custom">自定义脚本 (本地编辑)</option>
                     </select>
                     <div id="batchSourceBuiltinDiv" style="margin-top:8px">
                         <select id="batchBuiltinSelect" class="input">
@@ -865,30 +866,50 @@ input:checked + .slider:before{transform:translateX(16px)}
                         </select>
                     </div>
                     <div id="batchSourceUrlDiv" style="margin-top:8px;display:none">
-                        <input id="batchScriptUrl" class="input" placeholder="https://raw.githubusercontent.com/user/repo/main/worker.js">
-                        <div class="note" style="font-size:12px;color:#666;margin-top:4px">注意：链接必须返回纯文本 JS 代码</div>
+                        <div style="display:flex;gap:8px;align-items:center">
+                            <input id="batchScriptUrl" class="input" placeholder="https://github.com/user/repo 或 raw链接" oninput="normalizeGithubUrl(this)">
+                            <button class="btn" style="white-space:nowrap;background:#0ea5e9;color:#fff;flex-shrink:0" onclick="autoFillFromRemoteScript()">&#128269; 自动解析</button>
+                        </div>
+                        <div class="note" style="font-size:12px;color:#666;margin-top:4px">支持直接粘贴 GitHub 项目地址，自动查找 <code>_worker.js</code> 并转换为 raw 链接；也可直接填写 raw 链接后点击「自动解析」</div><div id="urlConvertHint" style="font-size:12px;color:#10b981;margin-top:4px;display:none"></div>
+                    </div>
+                    <div id="batchSourceCustomDiv" style="margin-top:8px;display:none">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                            <span style="font-size:13px;font-weight:600;color:#374151">自定义脚本编辑器</span>
+                            <div style="display:flex;gap:6px">
+                                <button class="btn small" style="background:#0ea5e9;color:#fff" onclick="autoFillFromCustomScript()">&#128269; 解析依赖</button>
+                                <button class="btn small" style="background:#10b981;color:#fff" onclick="saveCustomScriptFile()">&#128190; 下载 _worker.js</button>
+                            </div>
+                        </div>
+                        <textarea id="batchCustomScript" class="input" rows="14" style="font-family:monospace;font-size:12px;min-height:280px;resize:vertical" placeholder="// 在此编写或粘贴你的 Worker 脚本&#10;export default {&#10;  async fetch(request, env, ctx) {&#10;    return new Response('Hello World');&#10;  }&#10;};"></textarea>
+                        <div id="scriptDepPreview" style="margin-top:8px;display:none;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 14px;font-size:12px;line-height:1.8"></div>
+                        <div style="font-size:11px;color:#9ca3af;margin-top:4px">脚本自动保存到 localStorage；停止输入 0.8 秒后自动解析依赖并展示预览</div>
                     </div>
                 </div>
                 <div class="card" style="margin-top:16px">
-                    <div style="font-weight:600;margin-bottom:12px">高级绑定配置 (可选)</div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                        <div style="font-weight:600">高级绑定配置</div>
+                        <span id="autoParseStatus" style="font-size:12px;color:#10b981;font-weight:600"></span>
+                    </div>
                     <div style="margin-bottom:16px">
                         <div style="font-size:13px;font-weight:600;margin-bottom:4px;color:#374151">环境变量 (ENV)</div>
                         <div id="batchEnvList"></div>
                         <button class="btn small" style="margin-top:6px" onclick="addBatchEnvRow()">+ 添加变量</button>
                     </div>
                     <div style="margin-bottom:16px;border-top:1px solid #eee;padding-top:10px">
-                        <div style="font-size:13px;font-weight:600;margin-bottom:4px;color:#374151">KV 命名空间 (自动查找或创建)</div>
-                        <div style="display:flex;gap:8px">
-                            <input id="batchKvBind" class="input" placeholder="绑定变量名 (如 MY_KV)">
-                            <input id="batchKvName" class="input" placeholder="KV 空间名称 (如 my-store)">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                            <div style="font-size:13px;font-weight:600;color:#374151">KV 命名空间 (自动查找或创建)</div>
+                            <button class="btn small" onclick="addBatchKvRow()">+ 添加</button>
                         </div>
+                        <div style="font-size:11px;color:#9ca3af;margin-bottom:6px">KV空间名留空则自动使用「Worker名-绑定名」</div>
+                        <div id="batchKvList"></div>
                     </div>
                     <div style="margin-bottom:16px;border-top:1px solid #eee;padding-top:10px">
-                        <div style="font-size:13px;font-weight:600;margin-bottom:4px;color:#374151">D1 数据库 (自动查找或创建)</div>
-                        <div style="display:flex;gap:8px">
-                            <input id="batchD1Bind" class="input" placeholder="绑定变量名 (如 DB)">
-                            <input id="batchD1Name" class="input" placeholder="数据库名称 (如 my-db)">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                            <div style="font-size:13px;font-weight:600;color:#374151">D1 数据库 (自动查找或创建)</div>
+                            <button class="btn small" onclick="addBatchD1Row()">+ 添加</button>
                         </div>
+                        <div style="font-size:11px;color:#9ca3af;margin-bottom:6px">数据库名留空则自动使用「Worker名-绑定名」</div>
+                        <div id="batchD1List"></div>
                     </div>
                     <button class="btn primary" style="margin-top:10px;width:100%" onclick="startBatchCreate()">开始批量创建</button>
                 </div>
@@ -1454,9 +1475,291 @@ function renderStaticJS(env) {
         el('batchEnvList').innerHTML = ''; 
     }
     window.toggleSelectAllAccounts = function(checkbox) { document.querySelectorAll('.batch-acc-chk').forEach(c => c.checked = checkbox.checked); };
-    window.toggleBatchSourceInput = function() { const type = el('batchScriptSourceType').value; if (type === 'url') { el('batchSourceBuiltinDiv').style.display = 'none'; el('batchSourceUrlDiv').style.display = 'block'; } else { el('batchSourceBuiltinDiv').style.display = 'block'; el('batchSourceUrlDiv').style.display = 'none'; } };
+    window.toggleBatchSourceInput = function() {
+      const type = el('batchScriptSourceType').value;
+      el('batchSourceBuiltinDiv').style.display = (type==='builtin') ? 'block' : 'none';
+      el('batchSourceUrlDiv').style.display    = (type==='url')     ? 'block' : 'none';
+      el('batchSourceCustomDiv').style.display = (type==='custom')  ? 'block' : 'none';
+      if (type === 'custom') {
+        const saved = localStorage.getItem('cf_custom_worker_script');
+        if (saved && !el('batchCustomScript').value) el('batchCustomScript').value = saved;
+      }
+    };
     function appendBatchLog(msg, color='#fff') { const log = el('batchLog'); const span = document.createElement('div'); span.style.color = color; span.textContent = \`[\${new Date().toLocaleTimeString()}] \${msg}\`; log.appendChild(span); log.scrollTop = log.scrollHeight; }
     
+    // ==================== 自动解析 + 自定义脚本 ====================
+    function parseScriptDeps(scriptContent, workerName) {
+      var kvB=[], d1B=[], envV=[], seen={}, m;
+      var reKv=new RegExp('env[.]([A-Za-z][A-Za-z0-9_]*)[.](?:get|put|delete|list|getWithMetadata)[ \t]*[(]','g');
+      var reD1=new RegExp('env[.]([A-Za-z][A-Za-z0-9_]*)[.](?:prepare|exec|batch|dump)[ \t]*[(]','g');
+      var reAll=new RegExp('env[.]([A-Za-z][A-Za-z0-9_]*)','g');
+      var kvSet={}, d1Set={};
+      while((m=reKv.exec(scriptContent))!==null) kvSet[m[1]]=true;
+      while((m=reD1.exec(scriptContent))!==null) d1Set[m[1]]=true;
+      while((m=reAll.exec(scriptContent))!==null) seen[m[1]]=true;
+      Object.keys(seen).forEach(function(n){
+        if(d1Set[n]) d1B.push(n);
+        else if(kvSet[n]) kvB.push(n);
+        else envV.push(n);
+      });
+      return {kvB:kvB, d1B:d1B, envV:envV};
+    }
+
+    function renderDepPreview(kvB, d1B, envV, wn) {
+      var el2=el('scriptDepPreview'); if(!el2) return;
+      if(!kvB.length&&!d1B.length&&!envV.length){el2.style.display='none';return;}
+      var h='<div style="font-weight:600;margin-bottom:8px;color:#374151">&#128269; 检测到以下依赖（已自动填充到下方表单）</div>';
+      var tag=function(bg,c,b,t){return '<span style="background:'+bg+';color:'+c+';border:1px solid '+b+';border-radius:4px;padding:1px 7px;font-size:11px;font-weight:600;margin-right:6px">'+t+'</span>';};
+      var pill=function(v){return '<span style="background:#f1f5f9;border-radius:4px;padding:2px 8px;margin-right:4px;font-family:monospace">'+v+'</span>';};
+      if(kvB.length){
+        h+='<div style="margin-bottom:6px">'+tag('#eff6ff','#1e40af','#bfdbfe','KV');
+        kvB.forEach(function(b){h+=pill(b)+'<span style="color:#9ca3af;font-size:11px">&#8594;'+wn+'-'+b+'</span>&ensp;';});
+        h+='</div>';
+      }
+      if(d1B.length){
+        h+='<div style="margin-bottom:6px">'+tag('#fff7ed','#9a3412','#fed7aa','D1');
+        d1B.forEach(function(b){h+=pill(b)+'<span style="color:#9ca3af;font-size:11px">&#8594;'+wn+'-'+b+'</span>&ensp;';});
+        h+='</div>';
+      }
+      if(envV.length){
+        h+='<div>'+tag('#f0fdf4','#166534','#bbf7d0','ENV');
+        envV.forEach(function(v){h+=pill(v);});
+        h+='<span style="color:#ef4444;font-size:11px;margin-left:6px">&#9888;&#65039; 请在下方填写变量值</span></div>';
+      }
+      el2.innerHTML=h; el2.style.display='block';
+    }
+
+    function fillDepsFromScript(scriptContent, wn) {
+      var d=parseScriptDeps(scriptContent,wn);
+      el('batchKvList').innerHTML=''; el('batchD1List').innerHTML=''; el('batchEnvList').innerHTML='';
+      d.kvB.forEach(function(b){addBatchKvRow(b,wn+'-'+b);});
+      d.d1B.forEach(function(b){addBatchD1Row(b,wn+'-'+b);});
+      d.envV.forEach(function(v){
+        var div=document.createElement('div');
+        div.className='env-row-batch'; div.style.cssText='display:flex;gap:8px;margin-top:6px';
+        div.innerHTML='<input class="input b-env-key" placeholder="Key" value="'+v+'" style="flex:1">'
+                     +'<input class="input b-env-val" placeholder="请填写变量值" style="flex:1">'
+                     +'<button class="trash-btn" onclick="this.parentElement.remove()">&#10005;</button>';
+        el('batchEnvList').appendChild(div);
+      });
+      renderDepPreview(d.kvB,d.d1B,d.envV,wn);
+      var total=d.kvB.length+d.d1B.length+d.envV.length;
+      var st=el('autoParseStatus');
+      if(st) st.textContent=total>0?('✅ KV:'+d.kvB.length+'  D1:'+d.d1B.length+'  ENV:'+d.envV.length):'✅ 无依赖，可直接部署';
+      showNotification(total>0?('解析完成 KV:'+d.kvB.length+' D1:'+d.d1B.length+' ENV:'+d.envV.length+(d.envV.length?'，请填写 ENV 值':'')):'未检测到依赖，可直接部署');
+    }
+
+    // ===== GitHub URL 智能转换 =====
+    var WORKER_FILENAMES = ['_worker.js', 'worker.js', 'index.js', 'src/worker.js', 'src/index.js'];
+
+    function githubToRaw(ghUrl) {
+      // https://github.com/user/repo/blob/branch/path -> raw
+      var m = ghUrl.match(new RegExp('github[.]com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)'));
+
+      if (m) return 'https://raw.githubusercontent.com/' + m[1] + '/' + m[2] + '/' + m[3] + '/' + m[4];
+      // https://github.com/user/repo/tree/branch -> raw base (partial, needs file)
+      return null;
+    }
+
+    function isRawUrl(url) {
+      return url.includes('raw.githubusercontent.com') || url.includes('raw.github.com') || url.includes('cdn.jsdelivr.net');
+    }
+
+    function isGithubRepo(url) {
+      // matches github.com/user/repo with optional trailing /tree/branch but NO /blob/ and NO raw
+      return new RegExp('github[.]com/[^/]+/[^/]+(/tree/[^/]+)?/?$').test(url) && !url.includes('/blob/') && !isRawUrl(url);
+
+    }
+
+    window.normalizeGithubUrl = function(input) {
+      var val = input.value.trim();
+      var hint = el('urlConvertHint');
+      if (!val || isRawUrl(val)) { if(hint) hint.style.display='none'; return; }
+      var raw = githubToRaw(val);
+      if (raw) {
+        input.value = raw;
+        if(hint){ hint.textContent = '✅ 已转换为 raw 链接'; hint.style.display='block'; }
+        return;
+      }
+      if (isGithubRepo(val)) {
+        if(hint){ hint.textContent = '🔍 检测到 GitHub 仓库，点击「自动解析」将自动查找 _worker.js'; hint.style.display='block'; }
+      } else {
+        if(hint) hint.style.display='none';
+      }
+    };
+
+    async function resolveScriptUrl(inputUrl) {
+      // Already a raw/direct URL
+      if (isRawUrl(inputUrl)) return { url: inputUrl, converted: false };
+
+      // blob URL -> convert to raw
+      var raw = githubToRaw(inputUrl);
+      if (raw) return { url: raw, converted: true, msg: '已转换 blob 链接为 raw 链接' };
+
+      // GitHub repo URL -> search for worker file
+      if (isGithubRepo(inputUrl)) {
+        // Extract user/repo/branch
+        var m = inputUrl.match(new RegExp('github[.]com/([^/]+)/([^/]+)(?:/tree/([^/]+))?'));
+
+        if (!m) return { url: inputUrl, converted: false };
+        var user = m[1], repo = m[2], branch = m[3] || null;
+
+        // Get default branch if not specified
+        if (!branch) {
+          try {
+            var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo;
+            var r = await fetch(apiUrl, { headers: { 'Accept': 'application/vnd.github.v3+json' } });
+            if (r.ok) { var info = await r.json(); branch = info.default_branch || 'main'; }
+            else branch = 'main';
+          } catch(e) { branch = 'main'; }
+        }
+
+        // Search for worker files in order
+        for (var i = 0; i < WORKER_FILENAMES.length; i++) {
+          var fname = WORKER_FILENAMES[i];
+          var rawUrl = 'https://raw.githubusercontent.com/' + user + '/' + repo + '/' + branch + '/' + fname;
+          try {
+            var resp = await fetch(rawUrl, { method: 'HEAD' });
+            if (resp.ok) {
+              return { url: rawUrl, converted: true, msg: '找到 ' + fname + '，已转换为 raw 链接' };
+            }
+          } catch(e) {}
+        }
+        // Try GitHub API tree to find any .js file
+        try {
+          var treeUrl = 'https://api.github.com/repos/' + user + '/' + repo + '/git/trees/' + branch + '?recursive=1';
+          var tr = await fetch(treeUrl, { headers: { 'Accept': 'application/vnd.github.v3+json' } });
+          if (tr.ok) {
+            var tree = await tr.json();
+            var jsFiles = (tree.tree || []).filter(function(f){ return f.type === 'blob' && f.path.endsWith('.js') && !f.path.includes('node_modules'); });
+            if (jsFiles.length > 0) {
+              var best = jsFiles.sort(function(a,b){ return a.path.length - b.path.length; })[0];
+              var rawUrl2 = 'https://raw.githubusercontent.com/' + user + '/' + repo + '/' + branch + '/' + best.path;
+              return { url: rawUrl2, converted: true, msg: '未找到 _worker.js，使用 ' + best.path };
+            }
+          }
+        } catch(e) {}
+        return { url: inputUrl, converted: false, error: '未能在该仓库找到 JS 文件' };
+      }
+
+      return { url: inputUrl, converted: false };
+    }
+
+    window.autoFillFromRemoteScript = async function() {
+      var url=el('batchScriptUrl').value.trim();
+      if(!url) return showNotification('请先输入脚本链接','error');
+      var wn=(el('batchWorkerName').value.trim()||'worker');
+      var st=el('autoParseStatus'); if(st) st.textContent='⏳ 正在解析链接...';
+      var hint=el('urlConvertHint');
+      var btn=document.querySelector('[onclick="autoFillFromRemoteScript()"]');
+      if(btn){btn.disabled=true;btn.textContent='⏳ 解析中...';}
+      // Step1: 智能解析 URL（GitHub 仓库自动查找 _worker.js）
+      var resolved;
+      try{
+        if(st) st.textContent='⏳ 正在查找脚本文件...';
+        resolved = await resolveScriptUrl(url);
+        if(resolved.error){if(st)st.textContent='❌ '+resolved.error; showNotification(resolved.error,'error'); if(btn){btn.disabled=false;btn.textContent='\uD83D\uDD0D 自动解析';} return;}
+        if(resolved.converted){
+          el('batchScriptUrl').value = resolved.url;
+          if(hint){hint.textContent='✅ '+resolved.msg;hint.style.display='block';}
+          showNotification(resolved.msg);
+        }
+        url = resolved.url;
+      }catch(e){
+        if(st)st.textContent='❌ 链接解析失败: '+e.message;
+        if(btn){btn.disabled=false;btn.textContent='\uD83D\uDD0D 自动解析';} return;
+      }
+      if(st) st.textContent='⏳ 正在获取脚本内容...';
+      // 15秒超时
+      var controller=new AbortController();
+      var timer=setTimeout(function(){controller.abort();},15000);
+      try{
+        // 直接在前端 fetch，避免经过 Worker 中转的延迟
+        var fetchRes=await fetch(url,{signal:controller.signal,headers:{'User-Agent':'Mozilla/5.0'}}).catch(function(){
+          return null;
+        });
+        clearTimeout(timer);
+        var scriptContent=null;
+        if(fetchRes && fetchRes.ok){
+          scriptContent=await fetchRes.text();
+        } else {
+          // 前端直接 fetch 失败（跨域等），回退到 Worker 中转
+          if(st) st.textContent='⏳ 直连失败，通过服务器中转获取...';
+          var controller2=new AbortController();
+          var timer2=setTimeout(function(){controller2.abort();},20000);
+          try{
+            var res=await api('fetch-external-script',{url:url});
+            clearTimeout(timer2);
+            if(!res.success){if(st)st.textContent='❌ '+(res.error||'获取失败');return;}
+            scriptContent=res.content;
+          }catch(e2){
+            clearTimeout(timer2);
+            if(st)st.textContent='❌ 中转超时，请检查链接是否可访问';
+            showNotification('获取失败：'+e2.message,'error');
+            return;
+          }
+        }
+        if(!scriptContent){if(st)st.textContent='❌ 获取到空内容';return;}
+        fillDepsFromScript(scriptContent,wn);
+      }catch(e){
+        clearTimeout(timer);
+        var msg=e.name==='AbortError'?'请求超时(15s)，链接可能无法访问':e.message;
+        if(st)st.textContent='❌ '+msg;
+        showNotification(msg,'error');
+      }finally{
+        if(btn){btn.disabled=false;btn.textContent='\uD83D\uDD0D 自动解析';}
+      }
+    }
+
+    window.autoFillFromCustomScript = function() {
+      var s=el('batchCustomScript').value.trim();
+      if(!s) return showNotification('脚本内容为空','error');
+      fillDepsFromScript(s,(el('batchWorkerName').value.trim()||'worker'));
+    }
+
+    window.saveCustomScriptFile = function() {
+      var s=el('batchCustomScript').value;
+      if(!s.trim()) return showNotification('脚本内容为空','error');
+      localStorage.setItem('cf_custom_worker_script',s);
+      var blob=new Blob([s],{type:'text/javascript'});
+      var a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='_worker.js';
+      a.click(); URL.revokeObjectURL(a.href);
+      showNotification('已保存并下载为 _worker.js');
+    }
+
+    var _cstTimer=null;
+    document.addEventListener('input',function(e){
+      if(e.target&&e.target.id==='batchCustomScript'){
+        localStorage.setItem('cf_custom_worker_script',e.target.value);
+        clearTimeout(_cstTimer);
+        var val=e.target.value;
+        _cstTimer=setTimeout(function(){
+          if(val.trim()) fillDepsFromScript(val,(el('batchWorkerName')&&el('batchWorkerName').value.trim()||'worker'));
+        },800);
+      }
+    });
+
+    window.addBatchKvRow = function(bind,name){
+      bind=bind||''; name=name||'';
+      var div=document.createElement('div');
+      div.className='env-row-batch batch-kv-row'; div.style.cssText='display:flex;gap:8px;margin-top:6px';
+      div.innerHTML='<input class="input b-kv-bind" placeholder="绑定变量名 (如 MY_KV)" value="'+bind+'" style="flex:1">'
+                   +'<input class="input b-kv-name" placeholder="KV空间名(留空自动命名)" value="'+name+'" style="flex:1">'
+                   +'<button class="trash-btn" onclick="this.parentElement.remove()">&#10005;</button>';
+      el('batchKvList').appendChild(div);
+    }
+
+    window.addBatchD1Row = function(bind,name){
+      bind=bind||''; name=name||'';
+      var div=document.createElement('div');
+      div.className='env-row-batch batch-d1-row'; div.style.cssText='display:flex;gap:8px;margin-top:6px';
+      div.innerHTML='<input class="input b-d1-bind" placeholder="绑定变量名 (如 DB)" value="'+bind+'" style="flex:1">'
+                   +'<input class="input b-d1-name" placeholder="数据库名(留空自动命名)" value="'+name+'" style="flex:1">'
+                   +'<button class="trash-btn" onclick="this.parentElement.remove()">&#10005;</button>';
+      el('batchD1List').appendChild(div);
+    }
+    // ==================== end ====================
+
     window.addBatchEnvRow = function() {
         const div = document.createElement('div'); div.className='env-row-batch';
         div.innerHTML = \`<input class="input b-env-key" placeholder="Key" style="flex:1"><input class="input b-env-val" placeholder="Value" style="flex:1"><button class="trash-btn" onclick="this.parentElement.remove()">✕</button>\`;
@@ -1472,11 +1775,14 @@ function renderStaticJS(env) {
         const enableSubdomain = el('batchEnableSubdomain').checked;
 
         const sourceType = el('batchScriptSourceType').value;
-        let scriptUrl = '';
+        let scriptUrl = '', _customScript = '';
         if (sourceType === 'builtin') {
             const idx = el('batchBuiltinSelect').value;
             if (idx === '' || !BATCH_CONFIG.urls[idx]) return alert('请选择有效的模板或检查环境变量配置');
             scriptUrl = BATCH_CONFIG.urls[idx];
+        } else if (sourceType === 'custom') {
+            _customScript = el('batchCustomScript').value.trim();
+            if (!_customScript) return alert('自定义脚本内容为空，请先编写脚本');
         } else {
             scriptUrl = el('batchScriptUrl').value.trim();
             if (!scriptUrl) return alert('请输入脚本链接');
@@ -1489,21 +1795,28 @@ function renderStaticJS(env) {
             if (k) bindings.push({ type: 'plain_text', name: k, text: v });
         });
         
-        const kvBind = el('batchKvBind').value.trim();
-        const kvName = el('batchKvName').value.trim();
-        const useKv = kvBind && kvName;
-
-        const d1Bind = el('batchD1Bind').value.trim();
-        const d1Name = el('batchD1Name').value.trim();
-        const useD1 = d1Bind && d1Name;
+        const _wn = el('batchWorkerName').value.trim() || 'worker';
+        const kvRows = [...el('batchKvList').querySelectorAll('.batch-kv-row')].map(r => ({
+            bind: r.querySelector('.b-kv-bind').value.trim(),
+            name: r.querySelector('.b-kv-name').value.trim() || (_wn+'-'+r.querySelector('.b-kv-bind').value.trim())
+        })).filter(r => r.bind);
+        const d1Rows = [...el('batchD1List').querySelectorAll('.batch-d1-row')].map(r => ({
+            bind: r.querySelector('.b-d1-bind').value.trim(),
+            name: r.querySelector('.b-d1-name').value.trim() || (_wn+'-'+r.querySelector('.b-d1-bind').value.trim())
+        })).filter(r => r.bind);
 
         let scriptContent = '';
-        appendBatchLog('正在获取远程脚本: ' + scriptUrl, '#60a5fa');
-        try {
-            const res = await api('fetch-external-script', { url: scriptUrl });
-            if (res.success) { scriptContent = res.content; appendBatchLog('脚本获取成功', '#4ade80'); } 
-            else { appendBatchLog('脚本获取失败: ' + res.error, '#ef4444'); return; }
-        } catch (e) { appendBatchLog('脚本获取异常: ' + e.message, '#ef4444'); return; }
+        if (_customScript) {
+            scriptContent = _customScript;
+            appendBatchLog('使用自定义脚本（' + scriptContent.length + ' 字符）', '#60a5fa');
+        } else {
+            appendBatchLog('正在获取远程脚本: ' + scriptUrl, '#60a5fa');
+            try {
+                const res = await api('fetch-external-script', { url: scriptUrl });
+                if (res.success) { scriptContent = res.content; appendBatchLog('脚本获取成功', '#4ade80'); }
+                else { appendBatchLog('脚本获取失败: ' + res.error, '#ef4444'); return; }
+            } catch (e) { appendBatchLog('脚本获取异常: ' + e.message, '#ef4444'); return; }
+        }
 
         if (!scriptContent) return alert('脚本内容为空');
 
@@ -1530,38 +1843,32 @@ function renderStaticJS(env) {
 
                 const localBindings = [...bindings];
 
-                if (useKv) {
-                    appendBatchLog(\`   ↳ 检查 KV: \${kvName}\`, '#9ca3af');
-                    const kvList = await api('list-kv-namespaces', creds);
-                    let targetKv = kvList.result ? kvList.result.find(k => k.title === kvName) : null;
-                    
+                // 处理多 KV
+                const _kvListRes = kvRows.length > 0 ? await api('list-kv-namespaces', creds) : null;
+                for (const kv of kvRows) {
+                    appendBatchLog('   ↳ 检查 KV: ' + kv.name + '', '#9ca3af');
+                    let targetKv = (_kvListRes && _kvListRes.result) ? _kvListRes.result.find(k => k.title === kv.name) : null;
                     if (!targetKv) {
-                        appendBatchLog(\`   ↳ 创建 KV: \${kvName}\`, '#fbbf24');
-                        const createKv = await api('create-kv-namespace', { ...creds, title: kvName });
+                        appendBatchLog('   ↳ 创建 KV: ' + kv.name + '', '#fbbf24');
+                        const createKv = await api('create-kv-namespace', { ...creds, title: kv.name });
                         if (createKv.success && createKv.result) targetKv = createKv.result;
-                        else appendBatchLog(\`   ⚠️ KV创建失败: \${createKv.error}\`, '#ef4444');
+                        else { appendBatchLog('   ⚠️ KV创建失败: ' + (createKv.error||''), '#ef4444'); continue; }
                     }
-                    
-                    if (targetKv) {
-                        localBindings.push({ type: 'kv_namespace', name: kvBind, namespace_id: targetKv.id });
-                    }
+                    if (targetKv) localBindings.push({ type: 'kv_namespace', name: kv.bind, namespace_id: targetKv.id });
                 }
 
-                if (useD1) {
-                    appendBatchLog(\`   ↳ 检查 D1: \${d1Name}\`, '#9ca3af');
-                    const d1List = await api('list-d1', creds);
-                    let targetD1 = d1List.result ? d1List.result.find(d => d.name === d1Name) : null;
-                    
+                // 处理多 D1
+                const _d1ListRes = d1Rows.length > 0 ? await api('list-d1', creds) : null;
+                for (const d1 of d1Rows) {
+                    appendBatchLog('   ↳ 检查 D1: ' + d1.name + '', '#9ca3af');
+                    let targetD1 = (_d1ListRes && _d1ListRes.result) ? _d1ListRes.result.find(d => d.name === d1.name) : null;
                     if (!targetD1) {
-                        appendBatchLog(\`   ↳ 创建 D1: \${d1Name}\`, '#fbbf24');
-                        const createD1 = await api('create-d1-database', { ...creds, name: d1Name });
+                        appendBatchLog('   ↳ 创建 D1: ' + d1.name + '', '#fbbf24');
+                        const createD1 = await api('create-d1-database', { ...creds, name: d1.name });
                         if (createD1.success && createD1.result) targetD1 = createD1.result;
-                        else appendBatchLog(\`   ⚠️ D1创建失败: \${createD1.error}\`, '#ef4444');
+                        else { appendBatchLog('   ⚠️ D1创建失败: ' + (createD1.error||''), '#ef4444'); continue; }
                     }
-                    
-                    if (targetD1) {
-                        localBindings.push({ type: 'd1', name: d1Bind, id: targetD1.uuid || targetD1.id });
-                    }
+                    if (targetD1) localBindings.push({ type: 'd1', name: d1.bind, id: targetD1.uuid || targetD1.id });
                 }
 
                 const deployRes = await api('deploy-worker', { 
