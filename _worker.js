@@ -268,8 +268,13 @@ async function handleAPI(req, env) {
         const form = new FormData();
         const metadata = { 
           bindings: cleanedBindings,
-          usage_model: usage_model || 'standard'
+          usage_model: usage_model || 'standard',
+          placement: { mode: 'smart' },
+          compatibility_date: new Date().toISOString().slice(0,10)
         };
+        if (payload.enableCpuLimit === true) {
+          metadata.limits = { cpu_ms: 300000 };
+        }
 
         if (isModule) {
             metadata.main_module = 'worker.js';
@@ -567,7 +572,8 @@ body{font-family:Inter,system-ui,Arial;margin:0;background:var(--bg);color:#0f17
 .small{color:var(--muted);margin-bottom:12px}
 .account-row{padding:12px;border-radius:8px;border:1px solid #eef2ff;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
 .form-row{display:flex;gap:8px;margin-top:8px}
-.input{padding:10px;border-radius:8px;border:1px solid #e6edf3;width:100%}
+.input{padding:10px;border-radius:8px;border:1px solid #e6edf3;width:100%;box-sizing:border-box}
+textarea.input{overflow-y:auto;white-space:pre;word-wrap:normal;max-height:70vh;line-height:1.5}
 .btn{padding:10px 12px;border-radius:8px;border:0;background:var(--accent);color:#fff;cursor:pointer}
 .link{color:#2563eb;cursor:pointer}
 .note{font-size:13px;color:var(--muted);margin-top:8px}
@@ -681,8 +687,12 @@ body{font-family:Inter,Arial;margin:0;background:var(--bg);color:#0f1724}
 /* 修复：Modal 默认隐藏 (display: none)，修复打开页面自动弹窗问题 */
 .modal{display:none;position:fixed;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,0.45);align-items:center;justify-content:center;z-index:1000}
 .modal-box{width:720px;background:#fff;border-radius:12px;padding:20px;max-height:90vh;overflow:auto}
+.modal-box.fullscreen{width:100vw;height:100vh;max-width:100vw;max-height:100vh;border-radius:0;display:flex;flex-direction:column;padding:20px 32px}
+.modal-box.fullscreen textarea#createScript{flex:1;min-height:0!important;max-height:none!important;width:100%;box-sizing:border-box}
+.modal.fullscreen-overlay{align-items:stretch;justify-content:stretch}
 .modal-box.small{width:480px}
-.input{width:100%;padding:10px;border-radius:8px;border:1px solid #e6edf3}
+.input{width:100%;padding:10px;border-radius:8px;border:1px solid #e6edf3;box-sizing:border-box}
+textarea.input{overflow-y:auto;white-space:pre;word-wrap:normal;max-height:70vh;line-height:1.5}
 .kv-item{padding:8px;border-radius:8px;border:1px solid #f1f5f9;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
 pre{background:#0b1220;color:#e6f2ff;padding:12px;border-radius:8px;overflow:auto}
 .label{font-size:12px;color:#64748b;margin-bottom:6px}
@@ -852,6 +862,11 @@ input:checked + .slider:before{transform:translateX(16px)}
                     <div style="margin-top:12px">
                        <label class="small" style="display:flex;align-items:center;cursor:pointer">
                           <input type="checkbox" id="batchEnableSubdomain" checked style="margin-right:8px"> 开启默认域名 (*.workers.dev)
+                       </label>
+                    </div>
+                    <div style="margin-top:8px">
+                       <label class="small" style="display:flex;align-items:center;cursor:pointer">
+                          <input type="checkbox" id="batchEnableCpuLimit" style="margin-right:8px"> 设置 CPU 时间限制 (仅付费版 Workers 支持,免费版请勿勾选)
                        </label>
                     </div>
                     <label class="small" style="display:block;margin-top:12px">代码来源</label>
@@ -1076,16 +1091,19 @@ input:checked + .slider:before{transform:translateX(16px)}
   </div>
 </div></div>
 
-<div id="createModal" class="modal" style="display:none"><div class="modal-box">
-  <h3>新建 / 编辑 Worker</h3>
-  <div class="label">Worker 名称</div><input id="createName" class="input" placeholder="worker-name">
-  <div class="label" style="margin-top:8px">脚本 (.js)</div>
-  <textarea id="createScript" class="input" rows="20" style="min-height:420px;font-family:monospace;font-size:13px;resize:vertical">export default {
+<div id="createModal" class="modal fullscreen-overlay" style="display:none"><div class="modal-box fullscreen">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
+    <h3 style="margin:0">新建 / 编辑 Worker</h3>
+    <button class="btn" style="background:#e5e7eb;color:#111" onclick="closeCreate()">&#10005; 关闭</button>
+  </div>
+  <div style="flex-shrink:0"><div class="label">Worker 名称</div><input id="createName" class="input" placeholder="worker-name"></div>
+  <div class="label" style="margin-top:8px;flex-shrink:0">脚本 (.js)</div>
+  <textarea id="createScript" class="input" style="font-family:monospace;font-size:13px;white-space:pre;overflow:auto">export default {
   async fetch(request, env, ctx) {
     return new Response('Hello World');
   }
 };</textarea>
-  <div style="display:flex;gap:8px;margin-top:12px">
+  <div style="display:flex;gap:8px;margin-top:12px;flex-shrink:0">
     <button class="btn primary" onclick="confirmCreate()">保存并部署</button>
     <button class="btn" onclick="closeCreate()">取消</button>
   </div>
@@ -1871,11 +1889,13 @@ function renderStaticJS(env) {
                     if (targetD1) localBindings.push({ type: 'd1', name: d1.bind, id: targetD1.uuid || targetD1.id });
                 }
 
+                const enableCpuLimit = el('batchEnableCpuLimit').checked;
                 const deployRes = await api('deploy-worker', { 
                     ...creds,
                     scriptName: name,
                     scriptSource: scriptContent,
-                    metadataBindings: localBindings
+                    metadataBindings: localBindings,
+                    enableCpuLimit
                 });
 
                 if (deployRes.success) {
@@ -2025,9 +2045,9 @@ function renderStaticJS(env) {
     async function deleteWorkerDomain(scriptName, domainId, hostname) { if (!confirm('确定要解除绑定域名 ' + hostname + ' 吗？')) return; const accountId = localStorage.getItem('cf_accountId'); const res = await api('delete-worker-domain', { accountId, scriptName, domainId, hostname }); if (res && res.success) { showNotification('域名解绑成功'); refreshWorkers(); } else { showNotification(res.error || '解绑失败', 'error'); } }
 
     async function updateWorkerMetrics() { try { const usageRes = await api('get-usage-today', { accountId: localStorage.getItem('cf_accountId') }); if (usageRes && usageRes.success && usageRes.data) { const data = usageRes.data; const total = data.total || 0; const workers = data.workers || 0; const pages = data.pages || 0; const percentage = data.percentage || 0; el('metricCount').textContent = \`\${total.toLocaleString()} / 100,000\`; el('metricBar').style.width = \`\${percentage}%\`; el('workersRequests').textContent = workers.toLocaleString(); el('pagesRequests').textContent = pages.toLocaleString(); } else { el('metricCount').textContent = '0 / 100,000'; el('metricBar').style.width = '0%'; el('workersRequests').textContent = '0'; el('pagesRequests').textContent = '0'; } } catch (e) { console.error(e); } }
-    async function editWorker(name){ const accounts = await api('list-accounts'); const accountId = accounts.result?.[0]?.id; const res = await api('get-worker-script', { accountId, scriptName: name }); if (res && res.rawScript !== undefined) { el('createName').value = name; el('createName').readOnly = true; const ta = el('createScript'); ta.value = ''; ta.style.minHeight = '60vh'; ta.style.fontFamily = 'monospace'; ta.style.fontSize = '13px'; setTimeout(() => { ta.value = res.rawScript; }, 0); el('createModal').style.display='flex'; } else { showNotification('获取 Worker 脚本失败', 'error'); debugOut(res); } }
-    async function confirmCreate(){ const name = el('createName').value.trim(); const script = el('createScript').value; if (!name) return showNotification('请输入 Worker 名称', 'error'); const accountId = (await api('list-accounts')).result?.[0]?.id; const res = await api('deploy-worker', { accountId, scriptName: name, scriptSource: script, metadataBindings: [] }); if (res && res.success) { showNotification(res.message || 'Worker 部署成功'); el('createModal').style.display='none'; setTimeout(refreshWorkers, 800); } else { showNotification(res.error || '部署失败', 'error'); debugOut(res); } }
-    function closeCreate(){ el('createModal').style.display='none'; }
+    async function editWorker(name){ const accounts = await api('list-accounts'); const accountId = accounts.result?.[0]?.id; const res = await api('get-worker-script', { accountId, scriptName: name }); if (res && res.rawScript !== undefined) { el('createName').value = name; el('createName').readOnly = true; const ta = el('createScript'); ta.value = ''; ta.style.minHeight = '60vh'; ta.style.maxHeight = '70vh'; ta.style.overflowY = 'auto'; ta.style.whiteSpace = 'pre'; ta.style.fontFamily = 'monospace'; ta.style.fontSize = '13px'; setTimeout(() => { ta.value = res.rawScript; ta.scrollTop = 0; window._createScriptSnapshot = res.rawScript; }, 0); el('createModal').style.display='flex'; } else { showNotification('获取 Worker 脚本失败', 'error'); debugOut(res); } }
+    async function confirmCreate(){ const name = el('createName').value.trim(); const script = el('createScript').value; if (!name) return showNotification('请输入 Worker 名称', 'error'); const accountId = (await api('list-accounts')).result?.[0]?.id; const res = await api('deploy-worker', { accountId, scriptName: name, scriptSource: script, metadataBindings: [] }); if (res && res.success) { showNotification(res.message || 'Worker 部署成功'); window._createScriptSnapshot = script; el('createModal').style.display='none'; setTimeout(refreshWorkers, 800); } else { showNotification(res.error || '部署失败', 'error'); debugOut(res); } }
+    function closeCreate(){ const current = el('createScript').value; const nameVal = el('createName').value; const isNew = !el('createName').readOnly; const hasChanged = current !== window._createScriptSnapshot || (isNew && nameVal.trim() !== ''); if (hasChanged) { if (!confirm('有未保存的更改，确定要关闭吗？')) return; } el('createModal').style.display='none'; }
     async function deleteWorker(name){ if (!confirm('确定要删除 Worker: '+name+' 吗？')) return; const accountId = (await api('list-accounts')).result?.[0]?.id; const res = await api('delete-worker', { accountId, scriptName: name }); if (res && res.success) { showNotification(res.message || 'Worker 删除成功'); setTimeout(refreshWorkers, 600); } else { showNotification(res.error || '删除失败', 'error'); debugOut(res); } }
     
     let currentWorkerForEnv = '';
@@ -2086,7 +2106,7 @@ function renderStaticJS(env) {
     window.logout = function() { localStorage.removeItem('cf_active_email'); localStorage.removeItem('cf_active_key'); location.href = '/login'; };
     window.openAccountSwitcher = openAccountSwitcher; window.closeAccountSwitcher = closeAccountSwitcher;
     window.switchAccount = switchAccount; window.removeAccount = removeAccount;
-    window.openCreateWorker = function(){ el('createName').value=''; el('createScript').value = DEFAULT_WORKER_SCRIPT; el('createModal').style.display='flex'; };
+    window.openCreateWorker = function(){ el('createName').value=''; el('createName').readOnly = false; el('createScript').value = DEFAULT_WORKER_SCRIPT; window._createScriptSnapshot = DEFAULT_WORKER_SCRIPT; el('createModal').style.display='flex'; };
     window.openEnvFor = function(name){ el('createName').value = name; el('envModal').style.display='flex'; loadEnvVars(name); };
     window.openBindFor = function(name){ el('createName').value = name; el('bindModal').style.display='flex'; refreshBindList(); };
     window.addEnvRow = addEnvRow; window.saveEnv = saveEnv; window.closeEnvModal = closeEnvModal;
