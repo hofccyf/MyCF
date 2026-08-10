@@ -1,14 +1,14 @@
 /**
  * Cloudflare Worker: MyCF
  * 1. Cloudflare多账号管理系统，本版本为修改版，原作者： https://t.me/yifang_chat
- * 2. 推荐workers部署。
+ * 2. 推荐Workers、Pages部署。
  * 3. 推荐添加变量名称为大写的ACCESS_PASSWORD，建立访问密码。不设则不启用密码保护。
  * 4. 推荐建立任意名称KV空间。 绑定建立的KV空间，变量名为大写的CF_ACCOUNTS_KV，用来存储账号信息，不绑定则存储在本地浏览器。
  * 5. 绑定域名，访问域名，批量导入格式为：每行一个账号，格式：邮箱|GlobalApiKey。
  */
 
 
-// 支持批量创建workers,批量添加环境变量、kv、d1,是否开启workers分配的域名
+// 支持批量创建Workers、Pages批量添加环境变量、kv、d1,是否开启Workers、Pages分配的域名
 
 export default {
   async fetch(request, env, ctx) {
@@ -131,7 +131,7 @@ async function handleAPI(req, env) {
     'list-kv-keys','create-d1-database','delete-d1-database','execute-d1-query',
     'list-zones','create-zone','delete-zone','list-dns-records','create-dns-record','delete-dns-record',
     'update-dns-record','toggle-worker-domain','get-worker-analytics','get-usage-today',
-    'get-worker-domains','toggle-worker-subdomain','add-worker-domain', 'delete-worker-domain', 'get-worker-bindings'
+    'get-worker-domains','toggle-worker-subdomain','add-worker-domain', 'delete-worker-domain', 'get-worker-bindings','list-pages-projects','delete-pages-project','deploy-pages-direct'
   ]);
 
   if (needsCreds.has(action)) {
@@ -384,7 +384,140 @@ async function handleAPI(req, env) {
         } 
       }
       
-      case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountId || await getAccountId(payload.email, payload.key)}/storage/kv/namespaces`, payload.email, payload.key));
+      
+case 'list-pages-projects': {
+  const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+  return json(await cfGet('/accounts/' + accountId + '/pages/projects', payload.email, payload.key));
+}
+
+case 'delete-pages-project': {
+  const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+  const projectName = String(payload.projectName || '').trim();
+  if (!projectName) return json({ success:false, error:'projectName required' },400);
+  return json(await cfDelete('/accounts/' + accountId + '/pages/projects/' + encodeURIComponent(projectName), payload.email, payload.key));
+}
+
+case 'deploy-pages-direct': {
+  const projectName = String(payload.projectName || '').trim().toLowerCase();
+  const branch = String(payload.branch || 'main').trim() || 'main';
+  const inputFiles = Array.isArray(payload.files) ? payload.files : [];
+  const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,56}[a-z0-9])?$/.test(projectName)) return json({ success:false, error:'Pages 项目名仅支持小写字母、数字、连字符，长度 2-58' }, 400);
+  if (!inputFiles.length) return json({ success:false, error:'没有可部署的文件' }, 400);
+  if (inputFiles.length > 1000) return json({ success:false, error:'单次最多 1000 个文件' }, 400);
+
+  const paths = new Set();
+  const files = [];
+  let workerFile = null; // 提取 _worker.js 单独处理，不作为 asset 上传
+  
+  for (const item of inputFiles) {
+    const path = String(item && item.path || '');
+    const hash = String(item && item.hash || '').toLowerCase();
+    const base64 = String(item && item.base64 || '');
+    const isWorker = (path === '/_worker.js' || path === '_worker.js');
+    
+    // _worker.js 不需要作为 asset 上传，放宽对其 hash 的校验
+    if (!path.startsWith('/') || path.includes('..') || path.includes('\\\\') || (!isWorker && !/^[a-f0-9]{32}$/.test(hash))) return json({ success:false, error:'非法文件路径或 hash：' + path }, 400);
+    if (paths.has(path)) return json({ success:false, error:'重复文件路径：' + path }, 400);
+    if (!base64 || base64.length > 34952536) return json({ success:false, error:'文件为空或超过 25 MiB：' + path }, 400);
+    paths.add(path);
+    
+    if (isWorker) {
+      workerFile = { path: path, base64: base64, contentType: String(item.contentType || 'application/javascript+module') };
+    } else {
+      files.push({ path:path, hash:hash, base64:base64, contentType:String(item.contentType || 'application/octet-stream') });
+    }
+  }
+
+  let project = await cfGet('/accounts/' + accountId + '/pages/projects/' + encodeURIComponent(projectName), payload.email, payload.key);
+  if (!project || !project.success) {
+    const created = await cfPost('/accounts/' + accountId + '/pages/projects', payload.email, payload.key, { name:projectName, production_branch:branch });
+    if (!created || !created.success) return json({ success:false, step:'create-project', error:(created && created.errors && created.errors[0] && created.errors[0].message) || '创建 Pages 项目失败' }, 200);
+  }
+
+  // 先读取完整项目配置再合并，不能用片段 deployment_configs 覆盖已有 Functions 设置。
+  const currentProjectRes = await cfGet('/accounts/' + accountId + '/pages/projects/' + encodeURIComponent(projectName), payload.email, payload.key);
+  const oldConfigs = currentProjectRes && currentProjectRes.result && currentProjectRes.result.deployment_configs ? currentProjectRes.result.deployment_configs : {};
+  function mergeRuntimeConfig(environment) {
+    const old = oldConfigs[environment] || {};
+    const merged = Object.assign({}, old);
+    merged.placement = Object.assign({}, old.placement || {}, { mode: 'smart' });
+    if (payload.enableCpuLimit) {
+      const cpuMs = Math.max(1, Math.min(300000, Number(payload.cpuMs) || 300000));
+      merged.limits = Object.assign({}, old.limits || {}, { cpu_ms: cpuMs });
+    }
+    return merged;
+  }
+  const projectConfig = {
+    deployment_configs: Object.assign({}, oldConfigs, {
+      production: mergeRuntimeConfig('production'),
+      preview: mergeRuntimeConfig('preview')
+    })
+  };
+  const projectConfigRes = await cfAny('PATCH', '/accounts/' + accountId + '/pages/projects/' + encodeURIComponent(projectName), payload.email, payload.key, projectConfig);
+  if (!projectConfigRes || projectConfigRes.success === false) {
+    return json({ success:false, step:'pages-project-config', error:(projectConfigRes && projectConfigRes.errors && projectConfigRes.errors[0] && projectConfigRes.errors[0].message) || '保存 Pages 运行时配置失败' }, 200);
+  }
+
+  const tokenRes = await cfGet('/accounts/' + accountId + '/pages/projects/' + encodeURIComponent(projectName) + '/upload-token', payload.email, payload.key);
+  const jwt = tokenRes && tokenRes.result && (tokenRes.result.jwt || tokenRes.result.token);
+  if (!jwt) return json({ success:false, step:'upload-token', error:(tokenRes && tokenRes.errors && tokenRes.errors[0] && tokenRes.errors[0].message) || '获取 Pages 上传令牌失败' }, 200);
+
+  const headers = { Authorization:'Bearer ' + jwt, 'Content-Type':'application/json' };
+  let bucket = [], bucketSize = 0;
+  async function flush() {
+    if (!bucket.length) return;
+    const r = await fetch(CF_API_BASE + '/pages/assets/upload', { method:'POST', headers:headers, body:JSON.stringify(bucket) });
+    let data; try { data = await r.json(); } catch(e) { data = { success:r.ok }; }
+    if (!r.ok || data.success === false) throw new Error((data.errors && data.errors[0] && data.errors[0].message) || '资产上传失败 HTTP ' + r.status);
+    bucket = []; bucketSize = 0;
+  }
+  try {
+    for (const f of files) {
+      const size = f.base64.length + 512;
+      if (bucket.length && (bucket.length >= 100 || bucketSize + size > 40 * 1024 * 1024)) await flush();
+      bucket.push({ key:f.hash, value:f.base64, base64:true, metadata:{ contentType:f.contentType } });
+      bucketSize += size;
+    }
+    await flush();
+  } catch(e) { return json({ success:false, step:'assets-upload', error:String(e.message || e) }, 200); }
+
+  const hashesRes = await fetch(CF_API_BASE + '/pages/assets/upsert-hashes', { method:'POST', headers:headers, body:JSON.stringify({ hashes:files.map(function(f){ return f.hash; }) }) });
+  let hashesData; try { hashesData = await hashesRes.json(); } catch(e) { hashesData = { success:hashesRes.ok }; }
+  if (!hashesRes.ok || hashesData.success === false) return json({ success:false, step:'upsert-hashes', error:(hashesData.errors && hashesData.errors[0] && hashesData.errors[0].message) || '资产 hash 注册失败' }, 200);
+
+  const manifest = {};
+  files.forEach(function (f) {
+    let manifestPath = String(f.path || '');
+    if (!manifestPath.startsWith('/')) manifestPath = '/' + manifestPath;
+    manifest[manifestPath] = f.hash;
+  });
+  const form = new FormData();
+  form.append('manifest', JSON.stringify(manifest));
+  form.append('branch', branch);
+  form.append('commit_dirty', 'false');
+  form.append('commit_hash', crypto.randomUUID().replace(/-/g, '').slice(0, 40));
+  form.append('commit_message', 'Batch Pages deploy via MyCF');
+
+  // 如果存在 _worker.js，将其作为 Pages Function 单独附加到部署表单中
+  if (workerFile) {
+    try {
+      // 在 Worker 环境中使用 fetch data URI 高效且安全地解码 base64
+      const workerBlob = await fetch(`data:${workerFile.contentType};base64,${workerFile.base64}`).then(r => r.blob());
+      form.append('_worker.js', workerBlob, '_worker.js');
+    } catch(e) {
+      return json({ success:false, step:'worker-parse', error:'_worker.js 解码失败: ' + e.message }, 200);
+    }
+  }
+
+  const deployRes = await fetch(CF_API_BASE + '/accounts/' + accountId + '/pages/projects/' + encodeURIComponent(projectName) + '/deployments', { method:'POST', headers:{ 'X-Auth-Email':payload.email, 'X-Auth-Key':payload.key }, body:form });
+  let deploy; try { deploy = await deployRes.json(); } catch(e) { deploy = { success:deployRes.ok }; }
+  if (!deployRes.ok || deploy.success === false) return json({ success:false, step:'create-deployment', error:(deploy.errors && deploy.errors[0] && deploy.errors[0].message) || '创建部署失败' }, 200);
+  const result = deploy.result || {};
+  return json({ success:true, deployment:result, url:result.url || ('https://' + projectName + '.pages.dev'), pagesDomain:projectName + '.pages.dev', fileCount:files.length });
+}
+
+case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountId || await getAccountId(payload.email, payload.key)}/storage/kv/namespaces`, payload.email, payload.key));
       case 'create-kv-namespace': return json(await cfPost(`/accounts/${payload.accountId}/storage/kv/namespaces`, payload.email, payload.key, { title: payload.title }));
       case 'delete-kv-namespace': return json(await cfDelete(`/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}`, payload.email, payload.key));
       case 'list-kv-keys': return json(await cfGet(`/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/keys`, payload.email, payload.key));
@@ -780,7 +913,7 @@ input:checked + .slider:before{transform:translateX(16px)}
     
     <nav class="nav">
       <div class="item active" data-page="workers" onclick="navTo('workers')">Workers</div>
-      <div class="item" data-page="batch" onclick="navTo('batch')">批量创建 Worker</div>
+      <div class="item" data-page="batch" onclick="navTo('batch')">批量创建 Worker</div><div class="item" data-page="pages" onclick="navTo('pages')">批量部署 Pages</div><div class="item" data-page="pages-manager" onclick="navTo('pages-manager')">Pages 管理</div>
       <div class="item" data-page="kv" onclick="navTo('kv')">Workers KV</div>
       <div class="item" data-page="d1" onclick="navTo('d1')">D1 数据库</div>
       <div class="item" data-page="dns" onclick="navTo('dns')">域名管理</div>
@@ -934,7 +1067,35 @@ input:checked + .slider:before{transform:translateX(16px)}
         </div>
     </div>
 
-    <!-- KV Page -->
+    
+<!-- Pages Batch Page -->
+<div id="pages-page" class="page-content">
+  <div class="header"><div style="font-size:20px;font-weight:700">批量部署 Pages</div></div>
+  <div class="batch-layout">
+    <div class="batch-sidebar">
+      <div style="padding-bottom:10px;border-bottom:1px solid #eef2f6;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center"><span style="font-weight:600">选择账号</span><label style="font-size:12px;cursor:pointer"><input type="checkbox" id="pagesSelectAllAccounts" onchange="toggleSelectAllPagesAccounts(this)"> 全选</label></div>
+      <div id="pagesAccountList"></div>
+    </div>
+    <div class="batch-main">
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:12px">Pages Direct Upload</div>
+        <label class="small">项目名称</label><input id="pagesProjectName" class="input" placeholder="my-static-site" autocomplete="off">
+        <div style="margin-top:10px"><label class="small">部署分支</label><input id="pagesBranch" class="input" value="main" placeholder="main"></div><div style="margin-top:10px"><label class="small" style="display:flex;align-items:center;cursor:pointer"><input id="pagesEnableCpuLimit" type="checkbox" style="margin-right:8px">设置 Pages Functions CPU 时间限制（付费版，300 秒）</label></div>
+        <div style="margin-top:10px"><label class="small">上传来源</label><select id="pagesUploadMode" class="input"><option value="folder">构建输出文件夹</option><option value="zip">ZIP 压缩包</option></select></div>
+        <div id="pagesUploadDrop" style="margin-top:12px;padding:26px 18px;border:2px dashed #cbd5e1;border-radius:10px;text-align:center;color:#64748b;cursor:pointer">点击选择，或拖入构建输出文件夹 / ZIP 文件<br><span style="font-size:11px">文件夹支持递归目录；ZIP 在浏览器本地解压</span></div>
+        <input id="pagesFolderInput" type="file" webkitdirectory directory multiple style="display:none"><input id="pagesZipInput" type="file" accept=".zip,application/zip" style="display:none">
+        <div id="pagesFileSummary" class="small" style="margin-top:10px">尚未选择文件</div>
+      </div>
+      <div class="card" style="margin-top:16px"><div style="font-weight:600;margin-bottom:8px">执行</div><div class="small" style="margin-bottom:10px">每个账号中创建或更新同名 Pages 项目；不绑定 GitHub。</div><button class="btn primary" style="width:100%" onclick="startPagesBatchDeploy()">开始批量部署 Pages</button></div>
+      <div style="font-weight:600;margin-top:16px">执行日志</div><div id="pagesBatchLog" class="log-area">等待开始...</div>
+    </div>
+  </div>
+</div>
+
+<!-- Pages Manager Page -->
+<div id="pages-manager-page" class="page-content"><div class="header"><div style="font-size:20px;font-weight:700">Pages 管理</div><button class="btn primary" onclick="refreshPagesManager()">刷新列表</button></div><div class="card"><div class="small" style="margin-bottom:14px">列出当前账号全部 Pages 项目。删除项目会一并删除全部部署记录，且不可恢复。</div><div id="pagesManagerList"></div></div></div>
+
+<!-- KV Page -->
     <div id="kv-page" class="page-content">
       <div class="header">
         <div style="font-size:20px;font-weight:700">Workers KV 管理</div>
@@ -1220,7 +1381,7 @@ input:checked + .slider:before{transform:translateX(16px)}
   <div style="display:flex;justify-content:flex-end;margin-top:8px"><button class="btn" onclick="closeOut()">关闭</button></div>
 </div></div>
 
-<script src="/static.js"></script>
+<script async src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script><script async src="https://cdn.jsdelivr.net/npm/spark-md5@3.0.2/spark-md5.min.js"></script><script src="/static.js"></script>
 </body>
 </html>`;
 }
@@ -1475,7 +1636,7 @@ function renderStaticJS(env) {
       if (activeNav) activeNav.classList.add('active'); if (activePage) activePage.classList.add('active');
       switch(page) {
         case 'workers': refreshWorkers(); break;
-        case 'batch': renderBatchPage(); break;
+        case 'batch': renderBatchPage(); break; case 'pages': renderPagesBatchPage(); break; case 'pages-manager': refreshPagesManager(); break;
         case 'kv': refreshKVNamespaces(); break;
         case 'd1': refreshD1Databases(); break;
         case 'dns': showZonesList(); break;
@@ -1926,6 +2087,57 @@ function renderStaticJS(env) {
         appendBatchLog('批量操作结束', '#fcd34d');
     }
     window.startBatchCreate = startBatchCreate;
+
+let pagesSelectedFiles = [];
+let pagesUploadInited = false;
+function pagesNode(id) { return document.getElementById(id); }
+function pagesLog(text, color) { const box=pagesNode('pagesBatchLog'); if(!box)return; const d=document.createElement('div'); d.style.color=color||'#e2e8f0'; d.textContent='['+new Date().toLocaleTimeString()+'] '+text; box.appendChild(d); box.scrollTop=box.scrollHeight; }
+function pagesMime(path, type) { if(type)return type; const x=(path.split('.').pop()||'').toLowerCase(); return ({html:'text/html',htm:'text/html',css:'text/css',js:'application/javascript',mjs:'application/javascript',json:'application/json',svg:'image/svg+xml',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',webp:'image/webp',gif:'image/gif',ico:'image/x-icon',woff:'font/woff',woff2:'font/woff2',ttf:'font/ttf',wasm:'application/wasm',txt:'text/plain',map:'application/json'})[x]||'application/octet-stream'; }
+function pagesSummary(label) { const n=pagesSelectedFiles.reduce(function(a,x){return a+x.file.size;},0); const out=pagesNode('pagesFileSummary'); if(out)out.textContent=label+'：'+pagesSelectedFiles.length+' 个文件，'+(n/1048576).toFixed(2)+' MiB'; }
+async function pagesEntry(entry,prefix,out) { if(entry.isFile){const f=await new Promise(function(ok,bad){entry.file(ok,bad);});out.push({path:prefix+f.name,file:f,stripRoot:true});return;} if(!entry.isDirectory)return;const r=entry.createReader();let all=[];while(true){const a=await new Promise(function(ok,bad){r.readEntries(ok,bad);});if(!a.length)break;all=all.concat(Array.from(a));}for(const e of all)await pagesEntry(e,prefix+entry.name+'/',out); }
+async function pagesZip(file){if(typeof JSZip==='undefined')throw new Error('JSZip 加载失败，请刷新页面');const z=await JSZip.loadAsync(await file.arrayBuffer());const out=[];for(const name of Object.keys(z.files)){const e=z.files[name];if(e.dir)continue;const bytes=await e.async('uint8array');const blob=new Blob([bytes],{type:pagesMime(name,'')});out.push({path:name,file:new File([blob],name,{type:blob.type}),stripRoot:false});}return out;}
+function pagesPath(item){let p=String(item.path||'').split(String.fromCharCode(92)).join('/');while(p.startsWith('/'))p=p.slice(1);if(item.stripRoot){const n=p.indexOf('/');if(n>0)p=p.slice(n+1);}return '/'+p;}
+function initPagesUploadArea(){if(pagesUploadInited)return;const drop=pagesNode('pagesUploadDrop'),folder=pagesNode('pagesFolderInput'),zip=pagesNode('pagesZipInput'),mode=pagesNode('pagesUploadMode');if(!drop||!folder||!zip||!mode)return;pagesUploadInited=true;drop.onclick=function(){(mode.value==='zip'?zip:folder).click();};['dragenter','dragover'].forEach(function(k){drop.addEventListener(k,function(e){e.preventDefault();drop.style.borderColor='#2563eb';});});['dragleave','drop'].forEach(function(k){drop.addEventListener(k,function(e){e.preventDefault();drop.style.borderColor='#cbd5e1';});});drop.addEventListener('drop',async function(e){try{if(mode.value==='zip'){const f=Array.from(e.dataTransfer.files||[]).find(function(x){return String(x.name).toLowerCase().endsWith('.zip');;});if(!f)throw new Error('ZIP 模式请拖入 .zip 文件');pagesSelectedFiles=await pagesZip(f);pagesSummary('ZIP '+f.name);}else{const out=[];const entries=Array.from(e.dataTransfer.items||[]).map(function(x){return x.webkitGetAsEntry&&x.webkitGetAsEntry();}).filter(Boolean);if(entries.length){for(const entry of entries)await pagesEntry(entry,'',out);}else Array.from(e.dataTransfer.files||[]).forEach(function(f){out.push({path:f.webkitRelativePath||f.name,file:f,stripRoot:!!f.webkitRelativePath});});pagesSelectedFiles=out;pagesSummary('拖入文件夹');}}catch(err){showNotification(err.message||String(err),'error');}});folder.onchange=function(){pagesSelectedFiles=Array.from(folder.files||[]).map(function(f){return{path:f.webkitRelativePath||f.name,file:f,stripRoot:!!f.webkitRelativePath};});pagesSummary('选择文件夹');};zip.onchange=async function(){try{if(!zip.files[0])return;pagesSelectedFiles=await pagesZip(zip.files[0]);pagesSummary('ZIP '+zip.files[0].name);}catch(err){showNotification(err.message||String(err),'error');}};}
+function renderPagesBatchPage(){initPagesUploadArea();const list=pagesNode('pagesAccountList');if(!list)return;const accounts=loadSaved();list.innerHTML='';accounts.forEach(function(a,i){const row=document.createElement('div');row.className='account-check-item';row.innerHTML='<label style="display:flex;align-items:center;flex:1;cursor:pointer;font-size:13px"><input type="checkbox" class="pages-acc-chk" value="'+i+'" style="margin-right:8px">'+escapeHtml(a.email)+'</label>';list.appendChild(row);});}
+window.toggleSelectAllPagesAccounts=function(box){document.querySelectorAll('.pages-acc-chk').forEach(function(x){x.checked=!!box.checked;});};
+async function pagesFiles(){if(!pagesSelectedFiles.length)throw new Error('请先选择文件夹或 ZIP');if(pagesSelectedFiles.length>1000)throw new Error('文件数超过 1000');if(typeof SparkMD5==='undefined')throw new Error('SparkMD5 加载失败，请刷新页面');const result=[],seen=new Set();for(let i=0;i<pagesSelectedFiles.length;i++){const item=pagesSelectedFiles[i],file=item.file,path=pagesPath(item);if(path==='/'||path.includes('/../')||seen.has(path))throw new Error('非法或重复路径：'+path);if(file.size>25*1024*1024)throw new Error('单文件超过 25 MiB：'+path);seen.add(path);const buf=await file.arrayBuffer(),bytes=new Uint8Array(buf);let bin='';for(let p=0;p<bytes.length;p+=0x8000)bin+=String.fromCharCode.apply(null,bytes.subarray(p,Math.min(p+0x8000,bytes.length)));let hashPath=path;if(!hashPath.startsWith('/'))hashPath='/'+hashPath;const assetHasher=new SparkMD5.ArrayBuffer();assetHasher.append(buf);assetHasher.append(new TextEncoder().encode(hashPath).buffer);result.push({path:path,hash:assetHasher.end(),base64:btoa(bin),contentType:pagesMime(path,file.type)});if((i+1)%20===0)pagesLog('已处理 '+(i+1)+'/'+pagesSelectedFiles.length+' 文件','#93c5fd');}return result;}
+async function startPagesBatchDeploy(){const name=String(pagesNode('pagesProjectName').value||'').trim().toLowerCase(),branch=String(pagesNode('pagesBranch').value||'main').trim()||'main',enableCpuLimit=!!(pagesNode('pagesEnableCpuLimit')&&pagesNode('pagesEnableCpuLimit').checked),checks=Array.from(document.querySelectorAll('.pages-acc-chk:checked'));if(!/^[a-z0-9](?:[a-z0-9-]{0,56}[a-z0-9])?$/.test(name))return showNotification('项目名仅支持小写字母、数字、连字符，长度 2-58','error');if(!checks.length)return showNotification('至少选择一个账号','error');const log=pagesNode('pagesBatchLog');if(log)log.innerHTML='';try{pagesLog('正在读取和 hash 文件…','#93c5fd');const files=await pagesFiles(),accounts=loadSaved();pagesLog('共 '+files.length+' 个文件，开始部署。','#fcd34d');for(const c of checks){const a=accounts[Number(c.value)];if(!a)continue;const creds={email:a.email,key:a.key};const ars=await api('list-accounts',creds),aid=ars&&ars.result&&ars.result[0]&&ars.result[0].id;if(!aid){pagesLog('✗ '+a.email+'：无法获取 Account ID','#f87171');continue;}const r=await api('deploy-pages-direct',{email:a.email,key:a.key,accountId:aid,projectName:name,branch:branch,enableCpuLimit:enableCpuLimit,cpuMs:300000,files:files});if(r&&r.success){pagesLog('✓ '+a.email+'：部署成功','#4ade80');pagesLog('  '+(r.url||'https://'+name+'.pages.dev'),'#60a5fa');}else pagesLog('✗ '+a.email+' ['+((r&&r.step)||'unknown')+']：'+((r&&r.error)||'部署失败'),'#f87171');}pagesLog('全部任务结束。','#fcd34d');}catch(e){pagesLog('✗ '+(e.message||String(e)),'#f87171');}}
+window.startPagesBatchDeploy=startPagesBatchDeploy;
+
+async function refreshPagesManager(){
+  const box=el('pagesManagerList'); if(!box)return; box.innerHTML='<div class="small">正在读取 Pages 项目...</div>';
+  try{
+    // 账号可在登录页切换：每次都以当前凭据重新获取 ID，不能复用上一账号缓存。
+    const ar=await api('list-accounts');
+    const accountId=ar&&ar.result&&ar.result[0]&&ar.result[0].id;
+    if(accountId)localStorage.setItem('cfaccountId',accountId);
+    if(!accountId)throw new Error((ar&&ar.error)||'无法获取当前账号的 Account ID');
+    const res=await api('list-pages-projects',{accountId:accountId}); const projects=res&&res.success&&Array.isArray(res.result)?res.result:[];
+    box.innerHTML=''; if(!projects.length){box.innerHTML='<div class="small">当前账号没有 Pages 项目。</div>';return;}
+    projects.sort(function(x,y){return String(y.created_on||'').localeCompare(String(x.created_on||''));});
+    projects.forEach(function(p){
+      const name=p.name||p.id||'unknown', domain=p.subdomain||(name+'.pages.dev'), latest=p.latest_deployment||p.canonical_deployment||{};
+      const row=document.createElement('div');row.className='worker-row';
+      const info=document.createElement('div');info.className='worker-info';
+      const title=document.createElement('div');title.style.fontWeight='700';title.textContent=name;
+      const meta=document.createElement('div');meta.className='worker-meta';meta.textContent='生产分支：'+(p.production_branch||'main')+'　创建时间：'+(p.created_on?new Date(p.created_on).toLocaleString():'-');
+      const deploy=document.createElement('div');deploy.className='worker-meta';deploy.style.marginTop='5px';deploy.textContent='最近部署：'+(latest.created_on?new Date(latest.created_on).toLocaleString():'-');
+      const link=document.createElement('a');link.className='domain-tag workers-dev';link.href='https://'+domain;link.target='_blank';link.rel='noopener';link.textContent=domain;
+      info.append(title,meta,deploy,link);
+      const right=document.createElement('div');right.className='worker-right';const buttons=document.createElement('div');buttons.className='btns';
+      const open=document.createElement('button');open.className='btn';open.textContent='打开站点';open.onclick=function(){window.open('https://'+domain,'_blank','noopener');};
+      const del=document.createElement('button');del.className='btn danger';del.textContent='删除项目';del.onclick=function(){deletePagesProject(name,domain);};
+      buttons.append(open,del);right.appendChild(buttons);row.append(info,right);box.appendChild(row);
+    });
+  }catch(e){box.innerHTML='<div class="small" style="color:#ef4444">读取失败：'+escapeHtml(e.message||String(e))+'</div>';}
+}
+async function deletePagesProject(name,domain){
+  if(!confirm('确定删除 Pages 项目「'+name+'」吗？删除全部部署且不可恢复。默认域名：'+domain))return;
+  try{const ar=await api('list-accounts');const accountId=ar&&ar.result&&ar.result[0]&&ar.result[0].id;if(!accountId)throw new Error((ar&&ar.error)||'无法获取当前账号的 Account ID');localStorage.setItem('cfaccountId',accountId);const r=await api('delete-pages-project',{accountId:accountId,projectName:name});if(r&&r.success){showNotification('已删除：'+name);refreshPagesManager();}else showNotification((r&&r.error)||'删除失败','error');}catch(e){showNotification(e.message||String(e),'error');}
+}
+window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deletePagesProject;
+
+
 
     async function refreshWorkers() {
       el('workersList').innerHTML = '加载中...';
