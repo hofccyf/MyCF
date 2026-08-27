@@ -1,8 +1,14 @@
- * 1. Cloudflare多账号管理系统，本版本为修改版，原作者：  https://t.me/yifang_chat
- * 2. 推荐workers部署。
- * 3. 推荐添加变量名称为大写的ACCESS_PASSWORD，建立访问密码。不设则不启用密码保护。
- * 4. 推荐建立任意名称KV空间。 绑定建立的KV空间，变量名为大写的CF_ACCOUNTS_KV，用来存储账号信息，不绑定则存储在本地浏览器。
- * 5. 绑定域名，访问域名，批量导入格式为：每行一个账号，格式：邮箱|GlobalApiKey。
+ Cloudflare多账号管理系统，本版本为修改版，原作者：  https://t.me/yifang_chat
+ 
+推荐使用workers部署。
+
+支持workers、pages批量部署，支持snippets部署
+
+推荐添加变量名称为大写的ACCESS_PASSWORD，建立访问密码。不设则不启用密码保护。
+
+推荐建立任意名称KV空间。 绑定建立的KV空间，变量名为大写的CF_ACCOUNTS_KV，用来存储账号信息，不绑定则存储在本地浏览器。
+
+绑定域名，访问域名，批量导入格式为：每行一个账号，格式：邮箱|GlobalApiKey。
 
 
 <img width="824" height="898" alt="001" src="https://github.com/user-attachments/assets/750b2af2-9fc7-4186-b9fb-7c8afcb5fdfa" />
