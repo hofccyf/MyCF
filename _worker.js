@@ -1,14 +1,14 @@
 /**
  * Cloudflare Worker: MyCF
  * 1. Cloudflare多账号管理系统，本版本为修改版，原作者： https://t.me/yifang_chat
- * 2. 推荐Workers、Pages部署。
+ * 2. 推荐workers部署。
  * 3. 推荐添加变量名称为大写的ACCESS_PASSWORD，建立访问密码。不设则不启用密码保护。
  * 4. 推荐建立任意名称KV空间。 绑定建立的KV空间，变量名为大写的CF_ACCOUNTS_KV，用来存储账号信息，不绑定则存储在本地浏览器。
  * 5. 绑定域名，访问域名，批量导入格式为：每行一个账号，格式：邮箱|GlobalApiKey。
  */
 
 
-// 支持批量创建Workers、Pages批量添加环境变量、kv、d1,是否开启Workers、Pages分配的域名
+// 支持批量创建workers,批量添加环境变量、kv、d1,是否开启workers分配的域名
 
 export default {
   async fetch(request, env, ctx) {
@@ -131,7 +131,7 @@ async function handleAPI(req, env) {
     'list-kv-keys','create-d1-database','delete-d1-database','execute-d1-query',
     'list-zones','create-zone','delete-zone','list-dns-records','create-dns-record','delete-dns-record',
     'update-dns-record','toggle-worker-domain','get-worker-analytics','get-usage-today',
-    'get-worker-domains','toggle-worker-subdomain','add-worker-domain', 'delete-worker-domain', 'get-worker-bindings','list-pages-projects','delete-pages-project','deploy-pages-direct'
+    'get-worker-domains','toggle-worker-subdomain','add-worker-domain', 'delete-worker-domain', 'get-worker-bindings','list-pages-projects','delete-pages-project','deploy-pages-direct','list-snippets','get-snippet','deploy-snippet','delete-snippet','list-snippet-rules','add-snippet-rule','delete-snippet-rule'
   ]);
 
   if (needsCreds.has(action)) {
@@ -557,6 +557,94 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         return json({ success: r.ok });
       }
       
+
+      // ===== Snippets API =====
+      case 'list-snippets': {
+        const { zoneId } = payload;
+        if (!zoneId) return json({ success: false, error: 'zoneId required' }, 400);
+        return json(await cfGet(`/zones/${zoneId}/snippets`, payload.email, payload.key));
+      }
+
+      case 'get-snippet': {
+        const { zoneId, snippetName } = payload;
+        if (!zoneId || !snippetName) return json({ success: false, error: 'zoneId & snippetName required' }, 400);
+        const metaRes = await cfGet(`/zones/${zoneId}/snippets/${encodeURIComponent(snippetName)}`, payload.email, payload.key);
+        const contentResp = await fetch(`${CF_API_BASE}/zones/${zoneId}/snippets/${encodeURIComponent(snippetName)}/content`, { headers: { 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key } });
+        let snippetCode = '';
+        if (contentResp.ok) { try { snippetCode = await contentResp.text(); } catch(e) {} }
+        return json({ success: true, metadata: metaRes.result || {}, code: snippetCode });
+      }
+
+      case 'deploy-snippet': {
+        const { zoneId, snippetName, snippetCode } = payload;
+        if (!zoneId || !snippetName) return json({ success: false, error: 'zoneId & snippetName required' }, 400);
+        
+        const finalCode = snippetCode || "export default { async fetch(request, env, ctx) { return new Response('Hello from snippet'); } };";
+        const form = new FormData();
+        const metadata = { main_module: 'main.js' };
+        form.append('metadata', JSON.stringify(metadata));
+        form.append('main.js', new Blob([finalCode], { type:'application/javascript+module' }), 'main.js');
+        
+        const uploadUrl = `${CF_API_BASE}/zones/${zoneId}/snippets/${encodeURIComponent(snippetName)}`;
+        const resp = await fetch(uploadUrl, { method:'PUT', headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }, body: form });
+        
+        let text = ""; try { text = await resp.text(); } catch(e) { text = "{}"; }
+        let uploadRes; try { uploadRes = JSON.parse(text); } catch { uploadRes = { errors: [{ message: text }] }; }
+        
+        if (!resp.ok) return json({ success: false, error: '部署失败: ' + (uploadRes.errors?.[0]?.message || 'Unknown'), upload: uploadRes }, 200); 
+        return json({ success: true, message: 'Snippet 部署成功', upload: uploadRes });
+      }
+
+      case 'delete-snippet': {
+        const { zoneId, snippetName } = payload;
+        if (!zoneId || !snippetName) return json({ success: false, error: 'zoneId & snippetName required' }, 400);
+        return json(await cfDelete(`/zones/${zoneId}/snippets/${encodeURIComponent(snippetName)}`, payload.email, payload.key));
+      }
+
+      case 'list-snippet-rules': {
+        const { zoneId } = payload;
+        if (!zoneId) return json({ success: false, error: 'zoneId required' }, 400);
+        const res = await cfGet(`/zones/${zoneId}/snippets/ruleset`, payload.email, payload.key);
+        if (!res.success) { return json({ success: true, result: { rules: [] } }); }
+        return json(res);
+      }
+
+      case 'add-snippet-rule': {
+        const { zoneId, snippetName, expression, description } = payload;
+        if (!zoneId || !snippetName || !expression) return json({ success: false, error: 'zoneId, snippetName & expression required' }, 400);
+        
+        // 自动检查并创建 DNS 记录
+        try {
+          const hostMatches = [...expression.matchAll(/http\.host\s+eq\s+"([^"]+)"/g)];
+          for (const m of hostMatches) {
+            const hostname = m[1];
+            const dnsRes = await cfGet(`/zones/${zoneId}/dns_records?name=${encodeURIComponent(hostname)}`, payload.email, payload.key);
+            const records = dnsRes.result || [];
+            const hasProxied = records.some(r => r.proxied === true);
+            if (!hasProxied) {
+              await cfPost(`/zones/${zoneId}/dns_records`, payload.email, payload.key, {
+                type: 'AAAA', name: hostname, content: '100::', ttl: 1, proxied: true
+              });
+            }
+          }
+        } catch(e) {}
+
+        const rulesetRes = await cfGet(`/zones/${zoneId}/snippets/ruleset`, payload.email, payload.key);
+        let rules = [];
+        if (rulesetRes.success && rulesetRes.result && rulesetRes.result.rules) { rules = rulesetRes.result.rules; }
+        rules.push({ action: 'run_snippet', action_parameters: { snippet: snippetName }, expression: expression, description: description || 'Route to ' + snippetName });
+        return json(await cfAny('PUT', `/zones/${zoneId}/snippets/ruleset`, payload.email, payload.key, { rules: rules }));
+      }
+
+      case 'delete-snippet-rule': {
+        const { zoneId, ruleId } = payload;
+        if (!zoneId || !ruleId) return json({ success: false, error: 'zoneId & ruleId required' }, 400);
+        const rulesetRes = await cfGet(`/zones/${zoneId}/snippets/ruleset`, payload.email, payload.key);
+        if (!rulesetRes.success || !rulesetRes.result || !rulesetRes.result.rules) return json({ success: false, error: '获取规则集失败' });
+        const rules = rulesetRes.result.rules.filter(function(r) { return r.id !== ruleId; });
+        return json(await cfAny('PUT', `/zones/${zoneId}/snippets/ruleset`, payload.email, payload.key, { rules: rules }));
+      }
+
       case 'delete-worker': {
         const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(payload.scriptName)}`, { method:'DELETE', headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key } });
         return json({ success: r.ok });
@@ -784,7 +872,7 @@ function renderAppHTML() {
 <html>
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>cloudflare 第三方管理平台</title>
+<title>cloudflare 第三方管理平台0827</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#f6f8fa;--card:#fff;--muted:#6b7280;--accent:#2563eb;--danger:#ef4444}
@@ -909,7 +997,7 @@ input:checked + .slider:before{transform:translateX(16px)}
 <body data-page="app">
 <div class="app">
   <aside class="sidebar">
-    <div class="logo"><span style="font-size:18px">cloudflare</span>管理平台</div>
+    <div class="logo"><span style="font-size:18px">cloudflare</span>管理平台0827</div>
     
     <nav class="nav">
       <div class="item active" data-page="workers" onclick="navTo('workers')">Workers</div>
@@ -917,6 +1005,7 @@ input:checked + .slider:before{transform:translateX(16px)}
       <div class="item" data-page="kv" onclick="navTo('kv')">Workers KV</div>
       <div class="item" data-page="d1" onclick="navTo('d1')">D1 数据库</div>
       <div class="item" data-page="dns" onclick="navTo('dns')">域名管理</div>
+      <div class="item" data-page="snippets" onclick="navTo('snippets')">Snippets</div>
       <div class="item" data-page="settings" onclick="navTo('settings')">设置</div>
     </nav>
     
@@ -1172,6 +1261,44 @@ input:checked + .slider:before{transform:translateX(16px)}
       </div>
     </div>
 
+
+    <!-- Snippets Page -->
+    <div id="snippets-page" class="page-content">
+      <div class="header">
+        <div style="font-size:20px;font-weight:700">Snippets 管理</div>
+        <div>
+          <button class="btn primary" onclick="openAddZone()">添加新域名</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin:0">域名列表</h3>
+        <div class="small" style="margin-top:8px">选择域名以管理其 Snippets 和路由规则</div>
+        <div id="snippetsZonesList" style="margin-top:16px"></div>
+      </div>
+
+      <div id="snippetsSection" class="card" style="margin-top:16px;display:none">
+        <div class="zone-header">
+          <div>
+            <h3 style="margin:0" id="selectedSnippetZoneName">Snippets</h3>
+            <div class="small" id="selectedSnippetZoneInfo">管理选定域名的 Snippets</div>
+          </div>
+          <div class="zone-actions">
+            <button class="btn primary" onclick="openCreateSnippet()">创建 Snippet</button>
+            <button class="btn" onclick="openAddSnippetRule()">添加路由规则</button>
+            <button class="btn" onclick="backToSnippetZones()">返回域名列表</button>
+          </div>
+        </div>
+        <h4 style="margin:0 0 8px 0">Snippets 列表</h4>
+        <div id="snippetsList"></div>
+        <div style="margin-top:20px;border-top:1px solid #eef2f6;padding-top:16px">
+          <h4 style="margin:0 0 8px 0">路由规则</h4>
+          <div class="small" style="margin-bottom:8px">路由规则决定哪些请求会触发对应的 Snippet</div>
+          <div id="snippetRulesList"></div>
+        </div>
+      </div>
+    </div>
+
         <!-- Settings Page -->
     <div id="settings-page" class="page-content">
       <div class="header">
@@ -1375,6 +1502,43 @@ input:checked + .slider:before{transform:translateX(16px)}
   </div>
 </div></div>
 
+
+<!-- Snippet Modals -->
+<div id="createSnippetModal" class="modal fullscreen-overlay" style="display:none"><div class="modal-box fullscreen">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
+    <h3 style="margin:0">创建 / 编辑 Snippet</h3>
+    <button class="btn" style="background:#e5e7eb;color:#111" onclick="closeCreateSnippet()">&#10005; 关闭</button>
+  </div>
+  <div style="flex-shrink:0"><div class="label">Snippet 名称 (仅支持字母、数字、下划线、连字符)</div><input id="snippetName" class="input" placeholder="my-snippet"></div>
+  <div class="label" style="margin-top:8px;flex-shrink:0">JavaScript 代码 (ES Module 格式)</div>
+  <textarea id="snippetCode" class="input" style="font-family:monospace;font-size:13px;white-space:pre;overflow:auto;min-height:50vh">export default { async fetch(request, env, ctx) { return new Response('Hello from Snippet!'); } };</textarea>
+  <div style="display:flex;gap:8px;margin-top:12px;flex-shrink:0">
+    <button class="btn primary" onclick="confirmDeploySnippet()">保存并部署</button>
+    <button class="btn" onclick="closeCreateSnippet()">取消</button>
+  </div>
+</div></div>
+
+<div id="addSnippetRuleModal" class="modal" style="display:none"><div class="modal-box">
+  <h3>添加 Snippet 路由规则</h3>
+  <div class="label">选择 Snippet</div>
+  <select id="ruleSnippetSelect" class="input"></select>
+  
+  <div class="label" style="margin-top:12px">如果传入请求匹配：</div>
+  <div id="ruleConditionsContainer" style="display:flex;flex-direction:column;gap:8px;background:#f8fafc;padding:12px;border-radius:8px;border:1px solid #e2e8f0"></div>
+  <button class="btn small" style="margin-top:8px" onclick="addRuleCondition()">+ 添加条件</button>
+  
+  <div class="label" style="margin-top:12px">生成的表达式预览</div>
+  <input id="ruleExpression" class="input" readonly style="background:#f1f5f9;font-family:monospace;font-weight:600">
+  <div class="small" style="margin-top:4px">系统会自动解析表达式中的「主机名」，若该主机名在 DNS 中无记录，将自动创建指向 100:: 的代理记录。</div>
+  
+  <div class="label" style="margin-top:8px">描述 (可选)</div>
+  <input id="ruleDescription" class="input" placeholder="规则描述">
+  <div style="display:flex;gap:8px;margin-top:12px">
+    <button class="btn primary" onclick="confirmAddSnippetRule()">添加规则</button>
+    <button class="btn" onclick="closeAddSnippetRuleModal()">取消</button>
+  </div>
+</div></div>
+
 <div id="outModal" class="modal" style="display:none"><div class="modal-box">
   <h3>调试输出</h3>
   <pre id="debugOut" style="height:300px;overflow:auto"></pre>
@@ -1408,6 +1572,7 @@ function renderStaticJS(env) {
   function el(id){ return document.getElementById(id); }
   function safeParse(s){ try { return JSON.parse(s); } catch(e){ return null; } }
   function getActiveCreds(){ return { email: localStorage.getItem('cf_active_email')||'', key: localStorage.getItem('cf_active_key')||'' }; }
+  (async function(){ if(document.body.dataset.page==='login' && getActiveCreds().email){ try{ const r=await fetch('/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'check-features'})}); if(r.ok) location.replace('/workers'); }catch(e){} } })();
   
   function loadSaved(){ try { return JSON.parse(localStorage.getItem('cf_accounts')||'[]'); } catch(e){ return []; } }
   function saveAccounts(arr){ localStorage.setItem('cf_accounts', JSON.stringify(arr)); }
@@ -1489,7 +1654,7 @@ function renderStaticJS(env) {
         cont.appendChild(d);
       });
       Array.from(cont.querySelectorAll('button')).forEach(btn => {
-        btn.addEventListener('click', function(){ const idx = +this.dataset.idx; const arr = loadSaved(); if (!arr[idx]) return alert('账号不存在'); localStorage.setItem('cf_active_email', arr[idx].email); localStorage.setItem('cf_active_key', arr[idx].key); location.href='/workers'; });
+        btn.addEventListener('click', function(){ const idx = +this.dataset.idx; const arr = loadSaved(); if (!arr[idx]) return alert('账号不存在'); localStorage.setItem('cf_active_email', arr[idx].email); localStorage.setItem('cf_active_key', arr[idx].key); location.replace('/workers'); });
       });
     }
 
@@ -1515,7 +1680,7 @@ function renderStaticJS(env) {
         saveAccounts(arr);
         localStorage.setItem('cf_active_email', email);
         localStorage.setItem('cf_active_key', key);
-        location.href = '/workers';
+        location.replace('/workers');
       } else {
         alert('验证失败：' + (res && (res.errors||res.message||res.error) || 'unknown'));
       }
@@ -1639,7 +1804,7 @@ function renderStaticJS(env) {
         case 'batch': renderBatchPage(); break; case 'pages': renderPagesBatchPage(); break; case 'pages-manager': refreshPagesManager(); break;
         case 'kv': refreshKVNamespaces(); break;
         case 'd1': refreshD1Databases(); break;
-        case 'dns': showZonesList(); break;
+        case 'dns': showZonesList(); break; case 'snippets': showSnippetsZonesList(); break;
         case 'settings': loadSubdomainSettings(); break;
       }
     }
@@ -2295,7 +2460,7 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     async function deleteDNSRecord(zoneId, recordId) { if (!confirm('确定要删除此 DNS 记录吗？')) return; const res = await api('delete-dns-record', { zoneId, recordId }); if (res && res.success) { showNotification('DNS 记录删除成功'); refreshDNSRecords(zoneId); } else { showNotification(res.error || '删除失败', 'error'); } }
     async function deleteZone(zoneId) { if (!confirm('确定要删除此域名吗？此操作不可逆！')) return; const res = await api('delete-zone', { zoneId }); if (res && res.success) { showNotification('域名删除成功'); refreshZones(); } else { showNotification(res.error || '删除失败', 'error'); } }
     function closeAddZoneModal() { el('addZoneModal').style.display = 'none'; }
-    async function confirmAddZone() { const name = el('zoneName').value.trim(); if (!name) return showNotification('请输入域名', 'error'); const res = await api('create-zone', { name }); if (res && res.result) { showNotification('域名添加成功，请在域名注册商处修改 NS 记录'); el('addZoneModal').style.display = 'none'; refreshZones(); } else { showNotification(res.error || '添加失败', 'error'); } }
+    async function confirmAddZone() { const name = el('zoneName').value.trim(); if (!name) return showNotification('请输入域名', 'error'); const res = await api('create-zone', { name }); if (res && res.result) { showNotification('域名添加成功，请在域名注册商处修改 NS 记录'); el('addZoneModal').style.display = 'none'; refreshZones(); if (typeof refreshSnippetZones === 'function') refreshSnippetZones(); } else { showNotification(res.error || '添加失败', 'error'); } }
     async function loadSubdomainSettings() { const accountId = localStorage.getItem('cf_accountId'); if (!accountId) return; const res = await api('get-workers-subdomain', { accountId }); if (res && res.result) { const subdomain = res.result.subdomain; el('subdomainInput').value = subdomain || ''; } }
     async function saveSubdomain() { const subdomain = el('subdomainInput').value.trim(); if (!subdomain) return showNotification('请输入子域名', 'error'); const accountId = localStorage.getItem('cf_accountId'); const res = await api('put-workers-subdomain', { accountId, subdomain }); if (res && res.success) { showNotification(res.message || 'Workers 域名设置成功'); setTimeout(refreshWorkers, 1000); } else { showNotification(res.error || '设置保存失败', 'error'); } }
     
@@ -2344,6 +2509,286 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     window.refreshZones = refreshZones; window.refreshBindList = refreshBindList;
     window.openAddDomainModal = openAddDomainModal; window.closeAddDomainModal = closeAddDomainModal;
     window.confirmAddDomain = confirmAddDomain; window.deleteWorkerDomain = deleteWorkerDomain;
+
+    // ===== Snippets Management =====
+    var currentSnippetZoneId = null;
+    var currentSnippetZoneName = '';
+
+    async function refreshSnippetZones() {
+      var res = await api('list-zones');
+      var zones = (res && res.result) ? res.result : [];
+      var list = el('snippetsZonesList');
+      list.innerHTML = '';
+      if (zones.length === 0) {
+        list.innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280">暂无域名，请先添加域名</div>';
+        return;
+      }
+      var table = document.createElement('table');
+      table.className = 'domain-list-table';
+      table.innerHTML = '<thead><tr><th>域名</th><th style="width:100px">状态</th><th style="width:140px;text-align:right">操作</th></tr></thead><tbody></tbody>';
+      var tbody = table.querySelector('tbody');
+      zones.forEach(function(zone) {
+        var row = document.createElement('tr');
+        var statusHtml = zone.status === 'active'
+          ? '<span style="background:#f0fdf4;color:#166534;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600">已激活</span>'
+          : '<span style="background:#fffbeb;color:#d97706;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600">待处理</span>';
+        row.innerHTML = \`<td><div style="font-weight:600;font-size:14px">\${escapeHtml(zone.name)}</div></td><td>\${statusHtml}</td><td><div class="domain-row-actions"><button class="trash-btn" style="color:#2563eb;border-color:#dbeafe;background:#eff6ff" onclick="viewZoneSnippets('\${zone.id}', '\${escapeHtml(zone.name)}')">管理 Snippets</button></div></td>\`;
+        tbody.appendChild(row);
+      });
+      list.appendChild(table);
+    }
+
+    function showSnippetsZonesList() {
+      if (el('snippetsZonesList')) el('snippetsZonesList').style.display = 'block';
+      if (el('snippetsSection')) el('snippetsSection').style.display = 'none';
+      currentSnippetZoneId = null;
+      refreshSnippetZones();
+    }
+
+    function viewZoneSnippets(zoneId, zoneName) {
+      currentSnippetZoneId = zoneId;
+      currentSnippetZoneName = zoneName;
+      el('snippetsZonesList').style.display = 'none';
+      el('snippetsSection').style.display = 'block';
+      el('selectedSnippetZoneName').textContent = zoneName + ' - Snippets';
+      el('selectedSnippetZoneInfo').textContent = '管理 ' + zoneName + ' 的 Snippets 和路由规则';
+      refreshSnippets();
+      refreshSnippetRules();
+    }
+
+    function backToSnippetZones() { showSnippetsZonesList(); }
+
+    async function refreshSnippets() {
+      var res = await api('list-snippets', { zoneId: currentSnippetZoneId });
+      var snippets = (res && res.success && res.result) ? res.result : [];
+      var list = el('snippetsList');
+      list.innerHTML = '';
+      if (snippets.length === 0) {
+        list.innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280">暂无 Snippets，点击上方「创建 Snippet」按钮添加</div>';
+        return;
+      }
+      snippets.forEach(function(snippet) {
+        var name = snippet.snippet_name || snippet.name || 'unknown';
+        var created = snippet.created_on || '';
+        var modified = snippet.modified_on || '';
+        var div = document.createElement('div');
+        div.className = 'worker-row';
+        div.innerHTML = \`<div class="worker-info"><div style="font-weight:700">\${escapeHtml(name)}</div><div class="worker-meta">创建：\${created}\${modified ? ' | 修改：' + modified : ''}</div></div><div class="worker-right"><div class="btns"><button class="btn" onclick="editSnippet('\${escapeHtml(name)}')">编辑</button><button class="btn danger" onclick="deleteSnippet('\${escapeHtml(name)}')">删除</button></div></div>\`;
+        list.appendChild(div);
+      });
+    }
+
+    async function refreshSnippetRules() {
+      var res = await api('list-snippet-rules', { zoneId: currentSnippetZoneId });
+      var rules = (res && res.success && res.result && res.result.rules) ? res.result.rules : [];
+      var list = el('snippetRulesList');
+      list.innerHTML = '';
+      if (rules.length === 0) {
+        list.innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280">暂无路由规则，点击上方「添加路由规则」按钮配置</div>';
+        return;
+      }
+      var table = document.createElement('table');
+      table.className = 'dns-table';
+      table.innerHTML = '<thead><tr><th>Snippet</th><th>表达式</th><th>描述</th><th style="width:80px">操作</th></tr></thead><tbody></tbody>';
+      var tbody = table.querySelector('tbody');
+      rules.forEach(function(rule) {
+        var sn = (rule.action_parameters && rule.action_parameters.snippet) || '';
+        var expr = rule.expression || '';
+        var desc = rule.description || '';
+        var rid = rule.id || '';
+        var row = document.createElement('tr');
+        row.innerHTML = \`<td><span class="res-tag env">\${escapeHtml(sn)}</span></td><td style="font-family:monospace;font-size:12px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="\${escapeHtml(expr)}">\${escapeHtml(expr)}</td><td>\${escapeHtml(desc)}</td><td><button class="btn small danger" onclick="deleteSnippetRule('\${rid}', '\${escapeHtml(sn)}')">删除</button></td>\`;
+        tbody.appendChild(row);
+      });
+      list.appendChild(table);
+    }
+
+    function openCreateSnippet() {
+      currentEditingSnippet = '';
+      el('snippetName').value = '';
+      el('snippetName').readOnly = false;
+      el('snippetCode').value = "export default { async fetch(request, env, ctx) { return new Response('Hello from Snippet!'); } };";
+      el('createSnippetModal').style.display = 'flex';
+    }
+
+    async function editSnippet(name) {
+      currentEditingSnippet = name;
+      showNotification('正在获取 Snippet 代码...');
+      var res = await api('get-snippet', { zoneId: currentSnippetZoneId, snippetName: name });
+      el('snippetName').value = name;
+      el('snippetName').readOnly = true;
+      el('snippetCode').value = (res && res.success && res.code) ? res.code : "export default { async fetch(request, env, ctx) { return new Response('Hello from Snippet!'); } };";
+      el('createSnippetModal').style.display = 'flex';
+    }
+
+    function closeCreateSnippet() {
+      el('createSnippetModal').style.display = 'none';
+      currentEditingSnippet = '';
+    }
+
+    async function confirmDeploySnippet() {
+      var name = el('snippetName').value.trim();
+      var snippetCode = el('snippetCode').value;
+      if (!name) return showNotification('请输入 Snippet 名称', 'error');
+      if (!currentSnippetZoneId) return showNotification('请先选择域名', 'error');
+      if (!/^[a-zA-Z0-9_-]+$/.test(name)) return showNotification('Snippet 名称仅支持字母、数字、下划线、连字符', 'error');
+      var res = await api('deploy-snippet', { zoneId: currentSnippetZoneId, snippetName: name, snippetCode: snippetCode });
+      if (res && res.success) {
+        showNotification('Snippet 部署成功');
+        closeCreateSnippet();
+        refreshSnippets();
+      } else {
+        showNotification((res && res.errors && res.errors[0] && res.errors[0].message) || (res && res.error) || '部署失败', 'error');
+        debugOut(res);
+      }
+    }
+
+    async function deleteSnippet(name) {
+      if (!confirm('确定要删除 Snippet: ' + name + ' 吗？相关路由规则需要手动删除。')) return;
+      var res = await api('delete-snippet', { zoneId: currentSnippetZoneId, snippetName: name });
+      if (res && res.success) {
+        showNotification('Snippet 删除成功');
+        refreshSnippets();
+        refreshSnippetRules();
+      } else {
+        showNotification((res && res.errors && res.errors[0] && res.errors[0].message) || (res && res.error) || '删除失败', 'error');
+      }
+    }
+
+    function addRuleCondition() {
+      var container = el('ruleConditionsContainer');
+      var div = document.createElement('div');
+      div.style.cssText = 'display:flex;gap:8px;align-items:center;flex-wrap:wrap';
+      div.innerHTML = \`
+        <select class="input rule-field" style="flex:1;min-width:120px" onchange="updateRuleExpression()">
+          <option value="http.host">主机名</option>
+          <option value="http.request.uri.path">URI 路径</option>
+          <option value="http.request.uri">URI 完整</option>
+          <option value="http.request.uri.query">URI 查询字符串</option>
+          <option value="http.request.method">HTTP 方法</option>
+        </select>
+        <select class="input rule-op" style="flex:1;min-width:100px" onchange="updateRuleExpression()">
+          <option value="eq">等于</option>
+          <option value="ne">不等于</option>
+          <option value="contains">包含</option>
+          <option value="startsWith">开头是</option>
+          <option value="endsWith">结尾是</option>
+        </select>
+        <input type="text" class="input rule-val" style="flex:2;min-width:150px" placeholder="值" oninput="updateRuleExpression()">
+        <select class="input rule-logic" style="width:80px" onchange="updateRuleExpression()">
+          <option value="and">并且</option>
+          <option value="or">或者</option>
+        </select>
+        <button class="trash-btn" style="height:38px" onclick="this.parentElement.remove(); updateRuleExpression()">✕</button>
+      \`;
+      container.appendChild(div);
+      updateRuleExpression();
+    }
+
+    function updateRuleExpression() {
+      var rows = el('ruleConditionsContainer').children;
+      var parts = [];
+      for (var i = 0; i < rows.length; i++) {
+        var field = rows[i].querySelector('.rule-field').value;
+        var op = rows[i].querySelector('.rule-op').value;
+        var val = rows[i].querySelector('.rule-val').value.trim();
+        if (!val) continue;
+        
+        if (field === 'http.request.method') {
+          parts.push(field + ' ' + op + ' ' + val.toUpperCase());
+        } else {
+          parts.push(field + ' ' + op + ' "' + val + '"');
+        }
+        
+        if (i < rows.length - 1) {
+          var logic = rows[i].querySelector('.rule-logic').value;
+          parts.push(logic);
+        }
+      }
+      
+      var finalExpr = parts.join(' ');
+      if (parts.length > 1) {
+        finalExpr = '(' + finalExpr + ')';
+      }
+      el('ruleExpression').value = finalExpr;
+    }
+
+    function openAddSnippetRule() {
+      var select = el('ruleSnippetSelect');
+      select.innerHTML = '<option value="">加载中...</option>';
+      api('list-snippets', { zoneId: currentSnippetZoneId }).then(function(res) {
+        var snippets = (res && res.success && res.result) ? res.result : [];
+        select.innerHTML = '';
+        if (snippets.length === 0) {
+          select.innerHTML = '<option value="">暂无 Snippets，请先创建</option>';
+        } else {
+          snippets.forEach(function(s) {
+            var name = s.snippet_name || s.name;
+            var opt = document.createElement('option');
+            opt.value = name;
+            opt.textContent = name;
+            select.appendChild(opt);
+          });
+        }
+      });
+      el('ruleConditionsContainer').innerHTML = '';
+      addRuleCondition();
+      el('ruleDescription').value = '';
+      el('addSnippetRuleModal').style.display = 'flex';
+    }
+
+    function closeAddSnippetRuleModal() { el('addSnippetRuleModal').style.display = 'none'; }
+
+    async function confirmAddSnippetRule() {
+      var snippetName = el('ruleSnippetSelect').value;
+      var expression = el('ruleExpression').value.trim();
+      var description = el('ruleDescription').value.trim();
+      if (!snippetName) return showNotification('请选择 Snippet', 'error');
+      if (!expression) return showNotification('请输入路由表达式', 'error');
+      var res = await api('add-snippet-rule', {
+        zoneId: currentSnippetZoneId,
+        snippetName: snippetName,
+        expression: expression,
+        description: description || 'Route to ' + snippetName
+      });
+      if (res && res.success) {
+        showNotification('路由规则添加成功');
+        closeAddSnippetRuleModal();
+        refreshSnippetRules();
+      } else {
+        showNotification((res && res.errors && res.errors[0] && res.errors[0].message) || (res && res.error) || '添加失败', 'error');
+        debugOut(res);
+      }
+    }
+
+    async function deleteSnippetRule(ruleId, snippetName) {
+      if (!confirm('确定要删除此路由规则吗？(Snippet: ' + snippetName + ')')) return;
+      var res = await api('delete-snippet-rule', { zoneId: currentSnippetZoneId, ruleId: ruleId });
+      if (res && res.success) {
+        showNotification('路由规则删除成功');
+        refreshSnippetRules();
+      } else {
+        showNotification((res && res.errors && res.errors[0] && res.errors[0].message) || (res && res.error) || '删除失败', 'error');
+      }
+    }
+
+    window.showSnippetsZonesList = showSnippetsZonesList;
+    window.viewZoneSnippets = viewZoneSnippets;
+    window.backToSnippetZones = backToSnippetZones;
+    window.refreshSnippetZones = refreshSnippetZones;
+    window.openCreateSnippet = openCreateSnippet;
+    window.editSnippet = editSnippet;
+    window.closeCreateSnippet = closeCreateSnippet;
+    window.confirmDeploySnippet = confirmDeploySnippet;
+    window.deleteSnippet = deleteSnippet;
+    window.addRuleCondition = addRuleCondition;
+    window.updateRuleExpression = updateRuleExpression;
+    window.openAddSnippetRule = openAddSnippetRule;
+    window.closeAddSnippetRuleModal = closeAddSnippetRuleModal;
+    window.confirmAddSnippetRule = confirmAddSnippetRule;
+    window.deleteSnippetRule = deleteSnippetRule;
+
+
     window.viewZoneDNS = viewZoneDNS; window.deleteZone = deleteZone;
   }
 })();`;
