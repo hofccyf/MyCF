@@ -787,7 +787,7 @@ function renderLoginHTML(env) {
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
 :root { --accent: #0070f3; --accent2: #00d4ff; }
-body { font-family: Inter, system-ui, sans-serif; margin:0; height: 100vh; background: linear-gradient(135deg, #f0f4f8 0%, #d9e2ec 100%); display:flex; align-items:center; justify-content:center; color: #1e293b; overflow: hidden; position: relative; }
+body { font-family: Inter, system-ui, sans-serif; margin:0; min-height: 100vh; background: linear-gradient(135deg, #f0f4f8 0%, #d9e2ec 100%); display:flex; align-items:flex-start; justify-content:center; color: #1e293b; overflow-y: auto; position: relative; padding: 32px 0; }
 body::before { content: ''; position: absolute; width: 600px; height: 600px; background: radial-gradient(circle, rgba(0,112,243,0.15), transparent 70%); top: -200px; left: -100px; z-index: 0; }
 body::after { content: ''; position: absolute; width: 500px; height: 500px; background: radial-gradient(circle, rgba(0,212,255,0.15), transparent 70%); bottom: -150px; right: -100px; z-index: 0; }
 .container { max-width: 920px; margin: 32px auto; padding: 24px; position: relative; z-index: 1; width: 100%; }
