@@ -1,5 +1,5 @@
 /**
- * Cloudflare Worker: MyCF
+ * Cloudflare Worker: MyCF-260901
  * 1. Cloudflare多账号管理系统，本版本为修改版，原作者： https://t.me/yifang_chat
  * 2. 推荐workers部署。
  * 3. 推荐添加变量名称为大写的ACCESS_PASSWORD，建立访问密码。不设则不启用密码保护。
@@ -271,11 +271,12 @@ async function handleAPI(req, env) {
           usage_model: usage_model || 'standard',
           placement: { mode: 'smart' },
           compatibility_date: new Date().toISOString().slice(0,10),
-          observability: { enabled: true, head_sampling_rate: 1 }
+          observability: { enabled: false, head_sampling_rate: 1 }
         };
         if (payload.enableCpuLimit === true) {
           metadata.limits = { cpu_ms: 300000 };
         }
+        let autoDowngraded = false;
 
         if (isModule) {
             metadata.main_module = 'worker.js';
@@ -288,7 +289,7 @@ async function handleAPI(req, env) {
         }
 
         const uploadUrl = `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}`;
-        const resp = await fetch(uploadUrl, { method:'PUT', headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }, body: form });
+        let resp = await fetch(uploadUrl, { method:'PUT', headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }, body: form });
         
         let text = "";
         try { text = await resp.text(); } catch(e) { text = "{}"; }
@@ -296,8 +297,24 @@ async function handleAPI(req, env) {
         let uploadRes;
         try { uploadRes = JSON.parse(text); } catch { uploadRes = { errors: [{ message: text }] }; }
 
+        // 智能降级：如果设置了 CPU 限制但账号为免费版导致报错，则自动去掉限制重试
+        if (!resp.ok && metadata.limits && uploadRes.errors?.[0]?.message?.includes('CPU limits')) {
+          delete metadata.limits;
+          const retryForm = new FormData();
+          retryForm.append('metadata', JSON.stringify(metadata));
+          if (isModule) {
+            retryForm.append('worker.js', new Blob([finalScript], { type:'application/javascript+module' }), 'worker.js');
+          } else {
+            retryForm.append('script', new Blob([finalScript], { type:'application/javascript' }), 'worker.js');
+          }
+          resp = await fetch(uploadUrl, { method:'PUT', headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }, body: retryForm });
+          try { text = await resp.text(); } catch(e) { text = "{}"; }
+          try { uploadRes = JSON.parse(text); } catch { uploadRes = { errors: [{ message: text }] }; }
+          autoDowngraded = true;
+        }
+
         if (!resp.ok) return json({ success: false, error: '部署失败: ' + (uploadRes.errors?.[0]?.message || 'Unknown'), upload: uploadRes, uploadStatus: resp.status }, 200); 
-        return json({ success: true, message: 'Worker 部署成功', upload: uploadRes });
+        return json({ success: true, message: 'Worker 部署成功', upload: uploadRes, autoDowngraded: autoDowngraded });
       }
 
       case 'put-worker-variables': {
@@ -455,9 +472,21 @@ case 'deploy-pages-direct': {
       preview: mergeRuntimeConfig('preview')
     })
   };
-  const projectConfigRes = await cfAny('PATCH', '/accounts/' + accountId + '/pages/projects/' + encodeURIComponent(projectName), payload.email, payload.key, projectConfig);
+  let projectConfigRes = await cfAny('PATCH', '/accounts/' + accountId + '/pages/projects/' + encodeURIComponent(projectName), payload.email, payload.key, projectConfig);
+  let pagesAutoDowngraded = false;
   if (!projectConfigRes || projectConfigRes.success === false) {
-    return json({ success:false, step:'pages-project-config', error:(projectConfigRes && projectConfigRes.errors && projectConfigRes.errors[0] && projectConfigRes.errors[0].message) || '保存 Pages 运行时配置失败' }, 200);
+    const errMsg = (projectConfigRes && projectConfigRes.errors && projectConfigRes.errors[0] && projectConfigRes.errors[0].message) || '';
+    if (errMsg.includes('CPU limits') && projectConfig.deployment_configs.production.limits) {
+      delete projectConfig.deployment_configs.production.limits;
+      delete projectConfig.deployment_configs.preview.limits;
+      projectConfigRes = await cfAny('PATCH', '/accounts/' + accountId + '/pages/projects/' + encodeURIComponent(projectName), payload.email, payload.key, projectConfig);
+      if (!projectConfigRes || projectConfigRes.success === false) {
+        return json({ success:false, step:'pages-project-config', error:(projectConfigRes && projectConfigRes.errors && projectConfigRes.errors[0] && projectConfigRes.errors[0].message) || '保存 Pages 运行时配置失败' }, 200);
+      }
+      pagesAutoDowngraded = true;
+    } else {
+      return json({ success:false, step:'pages-project-config', error: errMsg || '保存 Pages 运行时配置失败' }, 200);
+    }
   }
 
   const tokenRes = await cfGet('/accounts/' + accountId + '/pages/projects/' + encodeURIComponent(projectName) + '/upload-token', payload.email, payload.key);
@@ -515,7 +544,7 @@ case 'deploy-pages-direct': {
   let deploy; try { deploy = await deployRes.json(); } catch(e) { deploy = { success:deployRes.ok }; }
   if (!deployRes.ok || deploy.success === false) return json({ success:false, step:'create-deployment', error:(deploy.errors && deploy.errors[0] && deploy.errors[0].message) || '创建部署失败' }, 200);
   const result = deploy.result || {};
-  return json({ success:true, deployment:result, url:result.url || ('https://' + projectName + '.pages.dev'), pagesDomain:projectName + '.pages.dev', fileCount:files.length });
+  return json({ success:true, deployment:result, url:result.url || ('https://' + projectName + '.pages.dev'), pagesDomain:projectName + '.pages.dev', fileCount:files.length, autoDowngraded: pagesAutoDowngraded });
 }
 
 case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountId || await getAccountId(payload.email, payload.key)}/storage/kv/namespaces`, payload.email, payload.key));
@@ -1016,12 +1045,14 @@ input:checked + .slider:before{transform:translateX(16px)}
     <div class="logo"><span style="font-size:18px">cloudflare</span>管理平台</div>
     
     <nav class="nav">
-      <div class="item active" data-page="workers" onclick="navTo('workers')">Workers</div>
-      <div class="item" data-page="batch" onclick="navTo('batch')">批量创建 Worker</div><div class="item" data-page="pages" onclick="navTo('pages')">批量部署 Pages</div><div class="item" data-page="pages-manager" onclick="navTo('pages-manager')">Pages 管理</div>
+      <div class="item active" data-page="workers" onclick="navTo('workers')">Workers管理</div>
+      <div class="item" data-page="pages-manager" onclick="navTo('pages-manager')">Pages管理</div>
+      <div class="item" data-page="snippets" onclick="navTo('snippets')">Snippets管理</div>
+      <div class="item" data-page="batch" onclick="navTo('batch')">批量创建 Worker</div>
+      <div class="item" data-page="pages" onclick="navTo('pages')">批量部署 Pages</div>
       <div class="item" data-page="kv" onclick="navTo('kv')">Workers KV</div>
       <div class="item" data-page="d1" onclick="navTo('d1')">D1 数据库</div>
       <div class="item" data-page="dns" onclick="navTo('dns')">域名管理</div>
-      <div class="item" data-page="snippets" onclick="navTo('snippets')">Snippets</div>
       <div class="item" data-page="settings" onclick="navTo('settings')">设置</div>
     </nav>
     
@@ -1103,9 +1134,7 @@ input:checked + .slider:before{transform:translateX(16px)}
                        </label>
                     </div>
                     <div style="margin-top:8px">
-                       <label class="small" style="display:flex;align-items:center;cursor:pointer">
-                          <input type="checkbox" id="batchEnableCpuLimit" style="margin-right:8px"> 设置 CPU 时间限制 (仅付费版 Workers 支持,免费版请勿勾选)
-                       </label>
+                       <span class="small">💡 系统将自动尝试开启 CPU 限制 (付费版生效，免费版自动忽略)</span>
                     </div>
                     <label class="small" style="display:block;margin-top:12px">代码来源</label>
                     <select id="batchScriptSourceType" class="input" onchange="toggleBatchSourceInput()">
@@ -1185,7 +1214,7 @@ input:checked + .slider:before{transform:translateX(16px)}
       <div class="card">
         <div style="font-weight:600;margin-bottom:12px">Pages Direct Upload</div>
         <label class="small">项目名称</label><input id="pagesProjectName" class="input" placeholder="my-static-site" autocomplete="off">
-        <div style="margin-top:10px"><label class="small">部署分支</label><input id="pagesBranch" class="input" value="main" placeholder="main"></div><div style="margin-top:10px"><label class="small" style="display:flex;align-items:center;cursor:pointer"><input id="pagesEnableCpuLimit" type="checkbox" style="margin-right:8px">设置 Pages Functions CPU 时间限制（付费版，300 秒）</label></div>
+        <div style="margin-top:10px"><label class="small">部署分支</label><input id="pagesBranch" class="input" value="main" placeholder="main"></div><div style="margin-top:10px"><span class="small">💡 系统将自动尝试开启 CPU 限制 (付费版生效，免费版自动忽略)</span></div>
         <div style="margin-top:10px"><label class="small">上传来源</label><select id="pagesUploadMode" class="input"><option value="folder">构建输出文件夹</option><option value="zip">ZIP 压缩包</option></select></div>
         <div id="pagesUploadDrop" style="margin-top:12px;padding:26px 18px;border:2px dashed #cbd5e1;border-radius:10px;text-align:center;color:#64748b;cursor:pointer">点击选择，或拖入构建输出文件夹 / ZIP 文件<br><span style="font-size:11px">文件夹支持递归目录；ZIP 在浏览器本地解压</span></div>
         <input id="pagesFolderInput" type="file" webkitdirectory directory multiple style="display:none"><input id="pagesZipInput" type="file" accept=".zip,application/zip" style="display:none">
@@ -2231,7 +2260,7 @@ function renderStaticJS(env) {
                     if (targetD1) localBindings.push({ type: 'd1', name: d1.bind, id: targetD1.uuid || targetD1.id });
                 }
 
-                const enableCpuLimit = el('batchEnableCpuLimit').checked;
+                const enableCpuLimit = true;
                 const deployRes = await api('deploy-worker', { 
                     ...creds,
                     scriptName: name,
@@ -2282,7 +2311,7 @@ function initPagesUploadArea(){if(pagesUploadInited)return;const drop=pagesNode(
 function renderPagesBatchPage(){initPagesUploadArea();const list=pagesNode('pagesAccountList');if(!list)return;const accounts=loadSaved();list.innerHTML='';accounts.forEach(function(a,i){const row=document.createElement('div');row.className='account-check-item';row.innerHTML='<label style="display:flex;align-items:center;flex:1;cursor:pointer;font-size:13px"><input type="checkbox" class="pages-acc-chk" value="'+i+'" style="margin-right:8px">'+escapeHtml(a.email)+'</label>';list.appendChild(row);});}
 window.toggleSelectAllPagesAccounts=function(box){document.querySelectorAll('.pages-acc-chk').forEach(function(x){x.checked=!!box.checked;});};
 async function pagesFiles(){if(!pagesSelectedFiles.length)throw new Error('请先选择文件夹或 ZIP');if(pagesSelectedFiles.length>1000)throw new Error('文件数超过 1000');if(typeof SparkMD5==='undefined')throw new Error('SparkMD5 加载失败，请刷新页面');const result=[],seen=new Set();for(let i=0;i<pagesSelectedFiles.length;i++){const item=pagesSelectedFiles[i],file=item.file,path=pagesPath(item);if(path==='/'||path.includes('/../')||seen.has(path))throw new Error('非法或重复路径：'+path);if(file.size>25*1024*1024)throw new Error('单文件超过 25 MiB：'+path);seen.add(path);const buf=await file.arrayBuffer(),bytes=new Uint8Array(buf);let bin='';for(let p=0;p<bytes.length;p+=0x8000)bin+=String.fromCharCode.apply(null,bytes.subarray(p,Math.min(p+0x8000,bytes.length)));let hashPath=path;if(!hashPath.startsWith('/'))hashPath='/'+hashPath;const assetHasher=new SparkMD5.ArrayBuffer();assetHasher.append(buf);assetHasher.append(new TextEncoder().encode(hashPath).buffer);result.push({path:path,hash:assetHasher.end(),base64:btoa(bin),contentType:pagesMime(path,file.type)});if((i+1)%20===0)pagesLog('已处理 '+(i+1)+'/'+pagesSelectedFiles.length+' 文件','#60a5fa');}return result;}
-async function startPagesBatchDeploy(){const name=String(pagesNode('pagesProjectName').value||'').trim().toLowerCase(),branch=String(pagesNode('pagesBranch').value||'main').trim()||'main',enableCpuLimit=!!(pagesNode('pagesEnableCpuLimit')&&pagesNode('pagesEnableCpuLimit').checked),checks=Array.from(document.querySelectorAll('.pages-acc-chk:checked'));if(!/^[a-z0-9](?:[a-z0-9-]{0,56}[a-z0-9])?$/.test(name))return showNotification('项目名仅支持小写字母、数字、连字符，长度 2-58','error');if(!checks.length)return showNotification('至少选择一个账号','error');const log=pagesNode('pagesBatchLog');if(log)log.innerHTML='';try{pagesLog('正在读取和 hash 文件…','#93c5fd');const files=await pagesFiles(),accounts=loadSaved();pagesLog('共 '+files.length+' 个文件，开始部署。','#fcd34d');for(const c of checks){const a=accounts[Number(c.value)];if(!a)continue;const creds={email:a.email,key:a.key};const ars=await api('list-accounts',creds),aid=ars&&ars.result&&ars.result[0]&&ars.result[0].id;if(!aid){pagesLog('✗ '+a.email+'：无法获取 Account ID','#f87171');continue;}const r=await api('deploy-pages-direct',{email:a.email,key:a.key,accountId:aid,projectName:name,branch:branch,enableCpuLimit:enableCpuLimit,cpuMs:300000,files:files});if(r&&r.success){pagesLog('✓ '+a.email+'：部署成功','#4ade80');pagesLog('  '+(r.url||'https://'+name+'.pages.dev'),'#60a5fa');}else pagesLog('✗ '+a.email+' ['+((r&&r.step)||'unknown')+']：'+((r&&r.error)||'部署失败'),'#f87171');}pagesLog('全部任务结束。','#fcd34d');}catch(e){pagesLog('✗ '+(e.message||String(e)),'#f87171');}}
+async function startPagesBatchDeploy(){const name=String(pagesNode('pagesProjectName').value||'').trim().toLowerCase(),branch=String(pagesNode('pagesBranch').value||'main').trim()||'main',enableCpuLimit=true,checks=Array.from(document.querySelectorAll('.pages-acc-chk:checked'));if(!/^[a-z0-9](?:[a-z0-9-]{0,56}[a-z0-9])?$/.test(name))return showNotification('项目名仅支持小写字母、数字、连字符，长度 2-58','error');if(!checks.length)return showNotification('至少选择一个账号','error');const log=pagesNode('pagesBatchLog');if(log)log.innerHTML='';try{pagesLog('正在读取和 hash 文件…','#93c5fd');const files=await pagesFiles(),accounts=loadSaved();pagesLog('共 '+files.length+' 个文件，开始部署。','#fcd34d');for(const c of checks){const a=accounts[Number(c.value)];if(!a)continue;const creds={email:a.email,key:a.key};const ars=await api('list-accounts',creds),aid=ars&&ars.result&&ars.result[0]&&ars.result[0].id;if(!aid){pagesLog('✗ '+a.email+'：无法获取 Account ID','#f87171');continue;}const r=await api('deploy-pages-direct',{email:a.email,key:a.key,accountId:aid,projectName:name,branch:branch,enableCpuLimit:enableCpuLimit,cpuMs:300000,files:files});if(r&&r.success){pagesLog('✓ '+a.email+'：部署成功'+(r.autoDowngraded?' (已自动取消CPU限制)':''),'#4ade80');pagesLog('  '+(r.url||'https://'+name+'.pages.dev'),'#60a5fa');}else pagesLog('✗ '+a.email+' ['+((r&&r.step)||'unknown')+']：'+((r&&r.error)||'部署失败'),'#f87171');}pagesLog('全部任务结束。','#fcd34d');}catch(e){pagesLog('✗ '+(e.message||String(e)),'#f87171');}}
 window.startPagesBatchDeploy=startPagesBatchDeploy;
 
 async function refreshPagesManager(){
