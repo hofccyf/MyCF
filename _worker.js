@@ -1,5 +1,5 @@
 /**
- * Cloudflare Worker: MyCF-260901
+ * Cloudflare Worker: MyCF
  * 1. Cloudflare多账号管理系统，本版本为修改版，原作者： https://t.me/yifang_chat
  * 2. 推荐workers部署。
  * 3. 推荐添加变量名称为大写的ACCESS_PASSWORD，建立访问密码。不设则不启用密码保护。
@@ -270,8 +270,7 @@ async function handleAPI(req, env) {
           bindings: cleanedBindings,
           usage_model: usage_model || 'standard',
           placement: { mode: 'smart' },
-          compatibility_date: new Date().toISOString().slice(0,10),
-          observability: { enabled: false, head_sampling_rate: 1 }
+          compatibility_date: new Date().toISOString().slice(0,10)
         };
         if (payload.enableCpuLimit === true) {
           metadata.limits = { cpu_ms: 300000 };
