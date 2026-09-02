@@ -1,5 +1,5 @@
 /**
- * Cloudflare Worker: MyCF
+ * Cloudflare Worker: MyCF  //20260902
  * 1. Cloudflare多账号管理系统，本版本为修改版，原作者： https://t.me/yifang_chat
  * 2. 推荐workers部署。
  * 3. 推荐添加变量名称为大写的ACCESS_PASSWORD，建立访问密码。不设则不启用密码保护。
@@ -1104,7 +1104,10 @@ input:checked + .slider:before{transform:translateX(16px)}
         <div class="card">
           <div style="display:flex;justify-content:space-between;align-items:center">
             <div><h2 style="margin:0">Workers 列表</h2><div class="small">查看和管理您的 Cloudflare Workers</div></div>
-            <div></div>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <label style="font-size:12px; cursor:pointer;"><input type="checkbox" id="selectAllWorkers" onchange="toggleSelectAllWorkers(this)"> 全选</label>
+              <button class="btn danger" onclick="batchDeleteWorkers()">批量删除</button>
+            </div>
           </div>
           <div class="workers-list" id="workersList"></div>
         </div>
@@ -1226,7 +1229,7 @@ input:checked + .slider:before{transform:translateX(16px)}
 </div>
 
 <!-- Pages Manager Page -->
-<div id="pages-manager-page" class="page-content"><div class="header"><div style="font-size:20px;font-weight:700">Pages 管理</div><button class="btn primary" onclick="refreshPagesManager()">刷新列表</button></div><div class="card"><div class="small" style="margin-bottom:14px">列出当前账号全部 Pages 项目。删除项目会一并删除全部部署记录，且不可恢复。</div><div id="pagesManagerList"></div></div></div>
+<div id="pages-manager-page" class="page-content"><div class="header"><div style="font-size:20px;font-weight:700">Pages 管理</div><button class="btn primary" onclick="refreshPagesManager()">刷新列表</button></div><div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><div class="small">列出当前账号全部 Pages 项目。删除项目会一并删除全部部署记录，且不可恢复。</div><div style="display:flex; gap:8px; align-items:center;"><label style="font-size:12px; cursor:pointer;"><input type="checkbox" id="selectAllPages" onchange="toggleSelectAllPages(this)"> 全选</label><button class="btn danger" onclick="batchDeletePages()">批量删除</button></div></div><div id="pagesManagerList"></div></div></div>
 
 <!-- KV Page -->
     <div id="kv-page" class="page-content">
@@ -2327,6 +2330,7 @@ async function refreshPagesManager(){
     projects.forEach(function(p){
       const name=p.name||p.id||'unknown', domain=p.subdomain||(name+'.pages.dev'), latest=p.latest_deployment||p.canonical_deployment||{};
       const row=document.createElement('div');row.className='worker-row';
+      const cb=document.createElement('input');cb.type='checkbox';cb.className='pages-cb';cb.value=name;cb.style.marginRight='16px';cb.style.alignSelf='center';row.appendChild(cb);
       const info=document.createElement('div');info.className='worker-info';
       const title=document.createElement('div');title.style.fontWeight='700';title.textContent=name;
       const meta=document.createElement('div');meta.className='worker-meta';meta.textContent='生产分支：'+(p.production_branch||'main')+'　创建时间：'+(p.created_on?new Date(p.created_on).toLocaleString():'-');
@@ -2379,6 +2383,7 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
         const div = document.createElement('div'); 
         div.className='worker-row';
         div.innerHTML = \`
+          <input type="checkbox" class="worker-cb" value="\${name}" style="margin-right: 16px; align-self: center;">
           <div class="worker-info">
             <div style="font-weight:700">\${name}</div>
             <div class="worker-meta">创建时间：\${created}</div>
@@ -2832,6 +2837,75 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     window.confirmAddSnippetRule = confirmAddSnippetRule;
     window.deleteSnippetRule = deleteSnippetRule;
 
+
+    window.toggleSelectAllWorkers = function(cb) {
+      document.querySelectorAll('.worker-cb').forEach(function(c){ c.checked = cb.checked; });
+    };
+    async function batchDeleteWorkers() {
+      const checked = Array.from(document.querySelectorAll('.worker-cb:checked'));
+      if (checked.length === 0) return showNotification('请至少选择一个要删除的 Worker', 'error');
+      if (!confirm('确定要删除选中的 ' + checked.length + ' 个 Worker 吗？此操作不可逆！')) return;
+      
+      const accountId = localStorage.getItem('cf_accountId');
+      let okCount = 0, failCount = 0;
+      showNotification('正在批量删除 ' + checked.length + ' 个 Worker...');
+      
+      const chunks = [];
+      for (let i = 0; i < checked.length; i += 10) {
+        chunks.push(checked.slice(i, i + 10));
+      }
+      
+      for (const chunk of chunks) {
+        await Promise.all(chunk.map(async (cb) => {
+          const name = cb.value;
+          const res = await api('delete-worker', { accountId, scriptName: name });
+          if (res && res.success) okCount++;
+          else failCount++;
+        }));
+      }
+      
+      showNotification('删除完成：成功 ' + okCount + ' 个，失败 ' + failCount + ' 个');
+      if (typeof refreshWorkers === 'function') refreshWorkers();
+    }
+    window.batchDeleteWorkers = batchDeleteWorkers;
+
+    window.toggleSelectAllPages = function(cb) {
+      document.querySelectorAll('.pages-cb').forEach(function(c){ c.checked = cb.checked; });
+    };
+    async function batchDeletePages() {
+      const checked = Array.from(document.querySelectorAll('.pages-cb:checked'));
+      if (checked.length === 0) return showNotification('请至少选择一个要删除的 Pages 项目', 'error');
+      if (!confirm('确定要删除选中的 ' + checked.length + ' 个 Pages 项目吗？此操作不可逆！')) return;
+      
+      let okCount = 0, failCount = 0;
+      showNotification('正在批量删除 ' + checked.length + ' 个 Pages 项目...');
+      
+      const chunks = [];
+      for (let i = 0; i < checked.length; i += 10) {
+        chunks.push(checked.slice(i, i + 10));
+      }
+      
+      let accountId = localStorage.getItem('cf_accountId');
+      if(!accountId) {
+         const ar = await api('list-accounts');
+         accountId = ar && ar.result && ar.result[0] && ar.result[0].id;
+         if(accountId) localStorage.setItem('cfaccountId', accountId);
+      }
+      if(!accountId) return showNotification('无法获取 Account ID', 'error');
+      
+      for (const chunk of chunks) {
+        await Promise.all(chunk.map(async (cb) => {
+          const name = cb.value;
+          const res = await api('delete-pages-project', { accountId, projectName: name });
+          if (res && res.success) okCount++;
+          else failCount++;
+        }));
+      }
+      
+      showNotification('删除完成：成功 ' + okCount + ' 个，失败 ' + failCount + ' 个');
+      if (typeof refreshPagesManager === 'function') refreshPagesManager();
+    }
+    window.batchDeletePages = batchDeletePages;
 
     window.viewZoneDNS = viewZoneDNS; window.deleteZone = deleteZone;
   }
