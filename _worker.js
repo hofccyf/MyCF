@@ -1,5 +1,5 @@
 /**
- * Cloudflare Worker: MyCF  //20260902
+ * Cloudflare Worker: MyCF
  * 1. Cloudflare多账号管理系统，本版本为修改版，原作者： https://t.me/yifang_chat
  * 2. 推荐workers部署。
  * 3. 推荐添加变量名称为大写的ACCESS_PASSWORD，建立访问密码。不设则不启用密码保护。
@@ -2213,6 +2213,7 @@ function renderStaticJS(env) {
 
         const accounts = loadSaved();
         el('batchLog').innerHTML = ''; 
+        let _wSuccess = 0, _wFail = 0, _wFailedAccts = [];
         appendBatchLog(\`开始批量部署，共选中 \${chks.length} 个账号\`, '#fbbf24');
 
         for (const chk of chks) {
@@ -2227,6 +2228,7 @@ function renderStaticJS(env) {
             try {
                 const accRes = await api('list-accounts', creds);
                 if (!accRes.success || !accRes.result || !accRes.result.length) {
+                    _wFail++; _wFailedAccts.push(acc.email);
                     appendBatchLog(\`❌ \${acc.email}: 获取账户ID失败\`, '#ef4444'); continue;
                 }
                 const accountId = accRes.result[0].id;
@@ -2272,8 +2274,14 @@ function renderStaticJS(env) {
                 });
 
                 if (deployRes.success) {
+                    _wSuccess++;
                     appendBatchLog(\`✅ \${acc.email}: 部署成功\`, '#4ade80');
-                    
+                    if (deployRes.autoDowngraded) {
+                        appendBatchLog('   ⚠️ 免费计划不支持部署CPU限制已略过', '#fbbf24');
+                    } else {
+                        appendBatchLog('   ✅ 已经成功部署CPU限制', '#4ade80');
+                    }
+
                     const enableSubdomain = el('batchEnableSubdomain').checked;
                     appendBatchLog(\`   ↳ 设置子域名: \${enableSubdomain ? '开启' : '关闭'}\`, '#9ca3af');
                     const toggleRes = await api('toggle-worker-subdomain', { ...creds, scriptName: name, enabled: enableSubdomain });
@@ -2289,14 +2297,20 @@ function renderStaticJS(env) {
                     }
 
                 } else {
+                    _wFail++; _wFailedAccts.push(acc.email);
                     appendBatchLog(\`❌ \${acc.email}: \${deployRes.error}\`, '#ef4444');
                 }
 
             } catch (e) {
+                _wFail++; _wFailedAccts.push(acc.email);
                 appendBatchLog(\`❌ \${acc.email}: 异常 \${e.message}\`, '#ef4444');
             }
         }
         appendBatchLog('批量操作结束', '#fcd34d');
+        appendBatchLog(\`总计: \${chks.length} 个账号，成功: \${_wSuccess} 个，失败: \${_wFail} 个\`, '#fbbf24');
+        if (_wFailedAccts.length > 0) {
+            appendBatchLog('失败账号: ' + _wFailedAccts.join(', '), '#f87171');
+        }
     }
     window.startBatchCreate = startBatchCreate;
 
@@ -2313,7 +2327,7 @@ function initPagesUploadArea(){if(pagesUploadInited)return;const drop=pagesNode(
 function renderPagesBatchPage(){initPagesUploadArea();const list=pagesNode('pagesAccountList');if(!list)return;const accounts=loadSaved();list.innerHTML='';accounts.forEach(function(a,i){const row=document.createElement('div');row.className='account-check-item';row.innerHTML='<label style="display:flex;align-items:center;flex:1;cursor:pointer;font-size:13px"><input type="checkbox" class="pages-acc-chk" value="'+i+'" style="margin-right:8px">'+escapeHtml(a.email)+'</label>';list.appendChild(row);});}
 window.toggleSelectAllPagesAccounts=function(box){document.querySelectorAll('.pages-acc-chk').forEach(function(x){x.checked=!!box.checked;});};
 async function pagesFiles(){if(!pagesSelectedFiles.length)throw new Error('请先选择文件夹或 ZIP');if(pagesSelectedFiles.length>1000)throw new Error('文件数超过 1000');if(typeof SparkMD5==='undefined')throw new Error('SparkMD5 加载失败，请刷新页面');const result=[],seen=new Set();for(let i=0;i<pagesSelectedFiles.length;i++){const item=pagesSelectedFiles[i],file=item.file,path=pagesPath(item);if(path==='/'||path.includes('/../')||seen.has(path))throw new Error('非法或重复路径：'+path);if(file.size>25*1024*1024)throw new Error('单文件超过 25 MiB：'+path);seen.add(path);const buf=await file.arrayBuffer(),bytes=new Uint8Array(buf);let bin='';for(let p=0;p<bytes.length;p+=0x8000)bin+=String.fromCharCode.apply(null,bytes.subarray(p,Math.min(p+0x8000,bytes.length)));let hashPath=path;if(!hashPath.startsWith('/'))hashPath='/'+hashPath;const assetHasher=new SparkMD5.ArrayBuffer();assetHasher.append(buf);assetHasher.append(new TextEncoder().encode(hashPath).buffer);result.push({path:path,hash:assetHasher.end(),base64:btoa(bin),contentType:pagesMime(path,file.type)});if((i+1)%20===0)pagesLog('已处理 '+(i+1)+'/'+pagesSelectedFiles.length+' 文件','#60a5fa');}return result;}
-async function startPagesBatchDeploy(){const name=String(pagesNode('pagesProjectName').value||'').trim().toLowerCase(),branch=String(pagesNode('pagesBranch').value||'main').trim()||'main',enableCpuLimit=true,checks=Array.from(document.querySelectorAll('.pages-acc-chk:checked'));if(!/^[a-z0-9](?:[a-z0-9-]{0,56}[a-z0-9])?$/.test(name))return showNotification('项目名仅支持小写字母、数字、连字符，长度 2-58','error');if(!checks.length)return showNotification('至少选择一个账号','error');const log=pagesNode('pagesBatchLog');if(log)log.innerHTML='';try{pagesLog('正在读取和 hash 文件…','#93c5fd');const files=await pagesFiles(),accounts=loadSaved();pagesLog('共 '+files.length+' 个文件，开始部署。','#fcd34d');for(const c of checks){const a=accounts[Number(c.value)];if(!a)continue;const creds={email:a.email,key:a.key};const ars=await api('list-accounts',creds),aid=ars&&ars.result&&ars.result[0]&&ars.result[0].id;if(!aid){pagesLog('✗ '+a.email+'：无法获取 Account ID','#f87171');continue;}const r=await api('deploy-pages-direct',{email:a.email,key:a.key,accountId:aid,projectName:name,branch:branch,enableCpuLimit:enableCpuLimit,cpuMs:300000,files:files});if(r&&r.success){pagesLog('✓ '+a.email+'：部署成功'+(r.autoDowngraded?' (已自动取消CPU限制)':''),'#4ade80');pagesLog('  '+(r.url||'https://'+name+'.pages.dev'),'#60a5fa');}else pagesLog('✗ '+a.email+' ['+((r&&r.step)||'unknown')+']：'+((r&&r.error)||'部署失败'),'#f87171');}pagesLog('全部任务结束。','#fcd34d');}catch(e){pagesLog('✗ '+(e.message||String(e)),'#f87171');}}
+async function startPagesBatchDeploy(){const name=String(pagesNode('pagesProjectName').value||'').trim().toLowerCase(),branch=String(pagesNode('pagesBranch').value||'main').trim()||'main',enableCpuLimit=true,checks=Array.from(document.querySelectorAll('.pages-acc-chk:checked'));if(!/^[a-z0-9](?:[a-z0-9-]{0,56}[a-z0-9])?$/.test(name))return showNotification('项目名仅支持小写字母、数字、连字符，长度 2-58','error');if(!checks.length)return showNotification('至少选择一个账号','error');const log=pagesNode('pagesBatchLog');if(log)log.innerHTML='';try{pagesLog('正在读取和 hash 文件…','#93c5fd');const files=await pagesFiles(),accounts=loadSaved();pagesLog('共 '+files.length+' 个文件，开始部署。','#fcd34d');var _pSuccess=0,_pFail=0,_pFailedAccts=[];for(const c of checks){const a=accounts[Number(c.value)];if(!a)continue;const creds={email:a.email,key:a.key};const ars=await api('list-accounts',creds),aid=ars&&ars.result&&ars.result[0]&&ars.result[0].id;if(!aid){pagesLog('✗ '+a.email+'：无法获取 Account ID','#f87171');_pFail++;_pFailedAccts.push(a.email);continue;}const r=await api('deploy-pages-direct',{email:a.email,key:a.key,accountId:aid,projectName:name,branch:branch,enableCpuLimit:enableCpuLimit,cpuMs:300000,files:files});if(r&&r.success){_pSuccess++;pagesLog('✓ '+a.email+'：部署成功','#4ade80');if(r.autoDowngraded){pagesLog('   ⚠️ 免费计划不支持部署CPU限制已略过','#fbbf24');}else{pagesLog('   ✅ 已经成功部署CPU限制','#4ade80');}pagesLog('  '+(r.url||'https://'+name+'.pages.dev'),'#60a5fa');}else{_pFail++;_pFailedAccts.push(a.email);pagesLog('✗ '+a.email+' ['+((r&&r.step)||'unknown')+']：'+((r&&r.error)||'部署失败'),'#f87171');}}pagesLog('全部任务结束。','#fcd34d');pagesLog('总计: '+checks.length+' 个账号，成功: '+_pSuccess+' 个，失败: '+_pFail+' 个','#fbbf24');if(_pFailedAccts.length>0)pagesLog('失败账号: '+_pFailedAccts.join(', '),'#f87171');}catch(e){pagesLog('✗ '+(e.message||String(e)),'#f87171');}}
 window.startPagesBatchDeploy=startPagesBatchDeploy;
 
 async function refreshPagesManager(){
