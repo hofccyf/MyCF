@@ -16,15 +16,53 @@ export default {
   }
 };
 
-// 兼容旧版 Worker 环境
 addEventListener('fetch', (event) => {
   event.respondWith(handleRequest(event.request, null));
 });
 
 const CF_API_BASE = 'https://api.cloudflare.com/client/v4';
 
-// ---------------- Router ----------------
-// -------- 密码保护辅助 --------
+const OBSERVABILITY_DEFAULTS = {
+  enabled: true,
+  head_sampling_rate: 1,
+  logs: { enabled: true, invocation_logs: true, persist: true, head_sampling_rate: 1 },
+  traces: { enabled: true, head_sampling_rate: 1, persist: true }
+};
+
+async function enableWorkerObservability(accountId, scriptName, email, key) {
+  const settingsUrl = `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}/script-settings`;
+  const authHeaders = { 'X-Auth-Email': email, 'X-Auth-Key': key };
+  try {
+    // 先读取现有 script-settings（logpush / tail_consumers / tags），合并后再 PATCH，避免整体覆盖丢失
+    let current = null;
+    try {
+      const g = await fetch(settingsUrl, { headers: authHeaders });
+      if (g.ok) {
+        const gd = await g.json();
+        if (gd && gd.success && gd.result && typeof gd.result === 'object') current = gd.result;
+      }
+    } catch (e) {}
+    const merged = (current && typeof current === 'object') ? Object.assign({}, current) : {};
+    const base = JSON.parse(JSON.stringify(OBSERVABILITY_DEFAULTS));
+    const target = Object.assign({}, base, (current && current.observability) || {});
+    target.enabled = true;
+    target.logs = Object.assign({}, base.logs, (current && current.observability && current.observability.logs) || {}, { enabled: true });
+    target.traces = Object.assign({}, base.traces, (current && current.observability && current.observability.traces) || {}, { enabled: true });
+    merged.observability = target;
+    const r = await fetch(settingsUrl, {
+      method: 'PATCH',
+      headers: Object.assign({}, authHeaders, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(merged)
+    });
+    let d = null;
+    try { d = await r.json(); } catch (e) { d = null; }
+    const ok = r.ok && (!d || d.success !== false);
+    return { ok: ok, status: r.status, detail: d };
+  } catch (e) {
+    return { ok: false, status: 0, detail: { error: String((e && e.message) || e) } };
+  }
+}
+
 function simpleHash(str) {
   let h = 0;
   for (let i = 0; i < str.length; i++) { h = (Math.imul(31, h) + str.charCodeAt(i)) | 0; }
@@ -41,7 +79,6 @@ async function handleRequest(request, env) {
   const p = url.pathname;
   const hasPassword = !!(env && env.ACCESS_PASSWORD);
 
-  // 密码验证接口（无需 session）
   if (p === '/auth' && request.method === 'POST') {
     try {
       const body = await request.json();
@@ -62,7 +99,6 @@ async function handleRequest(request, env) {
     }
   }
 
-  // session 校验（仅在设置了 ACCESS_PASSWORD 时生效）
   if (hasPassword) {
     const token = getSessionToken(request);
     const valid = !!(token && token === simpleHash(env.ACCESS_PASSWORD));
@@ -77,7 +113,6 @@ async function handleRequest(request, env) {
     }
   }
 
-  // 增加 no-store 防止缓存
   if (p === '/static.js' && request.method === 'GET') {
     return new Response(renderStaticJS(env), {
       headers: {
@@ -130,7 +165,7 @@ async function handleAPI(req, env) {
     'create-kv-namespace','delete-kv-namespace','put-kv-value','get-kv-value','delete-kv-value',
     'list-kv-keys','create-d1-database','delete-d1-database','execute-d1-query',
     'list-zones','create-zone','delete-zone','list-dns-records','create-dns-record','delete-dns-record',
-    'update-dns-record','toggle-worker-domain','get-worker-analytics','get-usage-today',
+    'update-dns-record','toggle-worker-domain','get-worker-analytics','get-usage-today','enable-worker-tracing',
     'get-worker-domains','toggle-worker-subdomain','add-worker-domain', 'delete-worker-domain', 'get-worker-bindings','list-pages-projects','delete-pages-project','deploy-pages-direct','list-snippets','get-snippet','deploy-snippet','delete-snippet','list-snippet-rules','add-snippet-rule','delete-snippet-rule'
   ]);
 
@@ -270,7 +305,8 @@ async function handleAPI(req, env) {
           bindings: cleanedBindings,
           usage_model: usage_model || 'standard',
           placement: { mode: 'smart' },
-          compatibility_date: new Date().toISOString().slice(0,10)
+          compatibility_date: new Date().toISOString().slice(0,10),
+          observability: JSON.parse(JSON.stringify(OBSERVABILITY_DEFAULTS))
         };
         if (payload.enableCpuLimit === true) {
           metadata.limits = { cpu_ms: 300000 };
@@ -296,7 +332,6 @@ async function handleAPI(req, env) {
         let uploadRes;
         try { uploadRes = JSON.parse(text); } catch { uploadRes = { errors: [{ message: text }] }; }
 
-        // 智能降级：如果设置了 CPU 限制但账号为免费版导致报错，则自动去掉限制重试
         if (!resp.ok && metadata.limits && uploadRes.errors?.[0]?.message?.includes('CPU limits')) {
           delete metadata.limits;
           const retryForm = new FormData();
@@ -313,7 +348,31 @@ async function handleAPI(req, env) {
         }
 
         if (!resp.ok) return json({ success: false, error: '部署失败: ' + (uploadRes.errors?.[0]?.message || 'Unknown'), upload: uploadRes, uploadStatus: resp.status }, 200); 
-        return json({ success: true, message: 'Worker 部署成功', upload: uploadRes, autoDowngraded: autoDowngraded });
+
+        const obsRes = await enableWorkerObservability(accountId, scriptName, payload.email, payload.key);
+
+        return json({ success: true, message: 'Worker 部署成功' + (obsRes && obsRes.ok ? '（Workers 日志+跟踪已开启）' : '（警告：Workers 跟踪开启失败，可在 Workers 列表点「开启跟踪」补开）'),
+          upload: uploadRes, autoDowngraded: autoDowngraded, observability: obsRes });
+      }
+
+      case 'enable-worker-tracing': {
+        const { scriptName, applyToAll } = payload;
+        if (!payload.accountId) return json({ success:false, error:'accountId required' }, 400);
+        if (applyToAll) {
+          const listRes = await cfGet(`/accounts/${payload.accountId}/workers/scripts`, payload.email, payload.key);
+          if (!listRes.success || !Array.isArray(listRes.result)) return json({ success:false, error:'获取 Worker 列表失败: ' + ((listRes.errors && listRes.errors[0] && listRes.errors[0].message) || 'Unknown') });
+          const targets = listRes.result.map(w => w.id || w.name || w.script_name).filter(Boolean);
+          const results = [];
+          for (const targetName of targets) {
+            const r = await enableWorkerObservability(payload.accountId, targetName, payload.email, payload.key);
+            results.push({ scriptName: targetName, ok: r.ok, status: r.status });
+          }
+          const okCount = results.filter(x => x.ok).length;
+          return json({ success: true, message: `已处理 ${targets.length} 个 Worker，成功开启 ${okCount} 个`, okCount: okCount, total: targets.length, results: results });
+        }
+        if (!scriptName) return json({ success:false, error:'scriptName required' }, 400);
+        const traceRes = await enableWorkerObservability(payload.accountId, scriptName, payload.email, payload.key);
+        return json({ success: traceRes.ok, message: traceRes.ok ? 'Workers 日志 + 跟踪已开启' : '开启失败，详情见 observability 字段', observability: traceRes });
       }
 
       case 'put-worker-variables': {
@@ -354,7 +413,7 @@ async function handleAPI(req, env) {
         
         const isModule = currentScript.includes('export default') || currentScript.includes('export {');
         const form = new FormData();
-        const metadata = { bindings: allBindings };
+        const metadata = { bindings: allBindings, observability: JSON.parse(JSON.stringify(OBSERVABILITY_DEFAULTS)) };
 
         if (isModule) {
             metadata.main_module = 'worker.js';
@@ -367,7 +426,9 @@ async function handleAPI(req, env) {
         }
         
         const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(scriptName)}`, { method: 'PUT', headers: { 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }, body: form });
-        return json({ success: r.ok, message: r.ok?'Saved':'Failed', details: await r.text() });
+        const putDetails = await r.text();
+        const obsRes2 = r.ok ? await enableWorkerObservability(payload.accountId, scriptName, payload.email, payload.key) : null;
+        return json({ success: r.ok, message: r.ok ? (obsRes2 && obsRes2.ok ? 'Saved（日志+跟踪已开启）' : 'Saved（警告：跟踪开启失败）') : 'Failed', details: putDetails, observability: obsRes2 });
       }
 
       case 'get-worker-variables': {
@@ -425,7 +486,7 @@ case 'deploy-pages-direct': {
 
   const paths = new Set();
   const files = [];
-  let workerFile = null; // 提取 _worker.js 单独处理，不作为 asset 上传
+  let workerFile = null;
   
   for (const item of inputFiles) {
     const path = String(item && item.path || '');
@@ -433,7 +494,6 @@ case 'deploy-pages-direct': {
     const base64 = String(item && item.base64 || '');
     const isWorker = (path === '/_worker.js' || path === '_worker.js');
     
-    // _worker.js 不需要作为 asset 上传，放宽对其 hash 的校验
     if (!path.startsWith('/') || path.includes('..') || path.includes('\\\\') || (!isWorker && !/^[a-f0-9]{32}$/.test(hash))) return json({ success:false, error:'非法文件路径或 hash：' + path }, 400);
     if (paths.has(path)) return json({ success:false, error:'重复文件路径：' + path }, 400);
     if (!base64 || base64.length > 34952536) return json({ success:false, error:'文件为空或超过 25 MiB：' + path }, 400);
@@ -452,13 +512,13 @@ case 'deploy-pages-direct': {
     if (!created || !created.success) return json({ success:false, step:'create-project', error:(created && created.errors && created.errors[0] && created.errors[0].message) || '创建 Pages 项目失败' }, 200);
   }
 
-  // 先读取完整项目配置再合并，不能用片段 deployment_configs 覆盖已有 Functions 设置。
   const currentProjectRes = await cfGet('/accounts/' + accountId + '/pages/projects/' + encodeURIComponent(projectName), payload.email, payload.key);
   const oldConfigs = currentProjectRes && currentProjectRes.result && currentProjectRes.result.deployment_configs ? currentProjectRes.result.deployment_configs : {};
   function mergeRuntimeConfig(environment) {
     const old = oldConfigs[environment] || {};
     const merged = Object.assign({}, old);
     merged.placement = Object.assign({}, old.placement || {}, { mode: 'smart' });
+    merged.observability = Object.assign({}, old.observability || {}, JSON.parse(JSON.stringify(OBSERVABILITY_DEFAULTS)));
     if (payload.enableCpuLimit) {
       const cpuMs = Math.max(1, Math.min(300000, Number(payload.cpuMs) || 300000));
       merged.limits = Object.assign({}, old.limits || {}, { cpu_ms: cpuMs });
@@ -528,7 +588,6 @@ case 'deploy-pages-direct': {
   form.append('commit_hash', crypto.randomUUID().replace(/-/g, '').slice(0, 40));
   form.append('commit_message', 'Batch Pages deploy via MyCF');
 
-  // 如果存在 _worker.js，将其作为 Pages Function 单独附加到部署表单中
   if (workerFile) {
     try {
       // 在 Worker 环境中使用 fetch data URI 高效且安全地解码 base64
@@ -642,7 +701,6 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         const { zoneId, snippetName, expression, description } = payload;
         if (!zoneId || !snippetName || !expression) return json({ success: false, error: 'zoneId, snippetName & expression required' }, 400);
         
-        // 自动检查并创建 DNS 记录
         try {
           const hostMatches = [...expression.matchAll(/http\.host\s+eq\s+"([^"]+)"/g)];
           for (const m of hostMatches) {
@@ -1106,6 +1164,7 @@ input:checked + .slider:before{transform:translateX(16px)}
             <div><h2 style="margin:0">Workers 列表</h2><div class="small">查看和管理您的 Cloudflare Workers</div></div>
             <div style="display:flex; gap:8px; align-items:center;">
               <label style="font-size:12px; cursor:pointer;"><input type="checkbox" id="selectAllWorkers" onchange="toggleSelectAllWorkers(this)"> 全选</label>
+              <button class="btn" onclick="batchEnableTracing()" title="为选中的 Worker 开启 Workers 日志+跟踪；未选中任何 Worker 时应用到当前账号全部">开启跟踪</button>
               <button class="btn danger" onclick="batchDeleteWorkers()">批量删除</button>
             </div>
           </div>
@@ -1758,7 +1817,6 @@ function renderStaticJS(env) {
     });
     document.getElementById('clearBtn').addEventListener('click', function(){ if(confirm('清除保存的账号？')){ localStorage.removeItem('cf_accounts'); renderSaved(); } });
 
-    // ===== 密码保护 + KV 账号同步 =====
     function saveAccounts(arr) {
       localStorage.setItem('cf_accounts', JSON.stringify(arr));
       fetch('/api', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ action:'save-accounts-kv', accounts: arr }) }).catch(()=>{});
@@ -1878,7 +1936,6 @@ function renderStaticJS(env) {
     };
     function appendBatchLog(msg, color='#e2e8f0') { const log = el('batchLog'); const span = document.createElement('div'); span.style.color = color; span.textContent = \`[\${new Date().toLocaleTimeString()}] \${msg}\`; log.appendChild(span); log.scrollTop = log.scrollHeight; }
     
-    // ==================== 自动解析 + 自定义脚本 ====================
     function parseScriptDeps(scriptContent, workerName) {
       var kvB=[], d1B=[], envV=[], seen={}, m;
       var reKv=new RegExp('env[.]([A-Za-z][A-Za-z0-9_]*)[.](?:get|put|delete|list|getWithMetadata)[ \t]*[(]','g');
@@ -1940,7 +1997,6 @@ function renderStaticJS(env) {
       showNotification(total>0?('解析完成 KV:'+d.kvB.length+' D1:'+d.d1B.length+' ENV:'+d.envV.length+(d.envV.length?'，请填写 ENV 值':'')):'未检测到依赖，可直接部署');
     }
 
-    // ===== GitHub URL 智能转换 =====
     var WORKER_FILENAMES = ['_worker.js', 'worker.js', 'index.js', 'src/worker.js', 'src/index.js'];
 
     function githubToRaw(ghUrl) {
@@ -2276,6 +2332,7 @@ function renderStaticJS(env) {
                 if (deployRes.success) {
                     _wSuccess++;
                     appendBatchLog(\`✅ \${acc.email}: 部署成功\`, '#4ade80');
+                    if (deployRes.observability) { appendBatchLog('   ↳ Workers 日志+跟踪: ' + (deployRes.observability.ok ? '✅ 已开启' : '⚠️ 开启失败'), deployRes.observability.ok ? '#4ade80' : '#fbbf24'); }
                     if (deployRes.autoDowngraded) {
                         appendBatchLog('   ⚠️ 免费计划不支持部署CPU限制已略过', '#fbbf24');
                     } else {
@@ -2882,6 +2939,42 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
       if (typeof refreshWorkers === 'function') refreshWorkers();
     }
     window.batchDeleteWorkers = batchDeleteWorkers;
+
+    async function batchEnableTracing() {
+      const checked = Array.from(document.querySelectorAll('.worker-cb:checked'));
+      const useAll = checked.length === 0;
+      if (!useAll && !confirm('确定为选中的 ' + checked.length + ' 个 Worker 开启「Workers 日志 + 跟踪」吗？')) return;
+      if (useAll && !confirm('未选中任何 Worker，将为当前账号【全部】 Worker 开启「Workers 日志 + 跟踪」，确定继续吗？')) return;
+      let accountId = localStorage.getItem('cf_accountId');
+      if (!accountId) {
+        const ar = await api('list-accounts');
+        accountId = ar && ar.result && ar.result[0] && ar.result[0].id;
+        if (accountId) localStorage.setItem('cfaccountId', accountId);
+      }
+      if (!accountId) return showNotification('无法获取 Account ID', 'error');
+      showNotification(useAll ? '正在为全部 Worker 开启 日志+跟踪...' : '正在为 ' + checked.length + ' 个 Worker 开启 日志+跟踪...');
+      try {
+        if (useAll) {
+          const res = await api('enable-worker-tracing', { accountId: accountId, applyToAll: true });
+          if (res && res.success) { showNotification(res.message || '操作完成'); }
+          else showNotification((res && (res.error || res.message)) || '操作失败', 'error');
+        } else {
+          let okCount = 0, failCount = 0;
+          const chunks = [];
+          for (let i = 0; i < checked.length; i += 10) chunks.push(checked.slice(i, i + 10));
+          for (const chunk of chunks) {
+            await Promise.all(chunk.map(async (cb) => {
+              const res = await api('enable-worker-tracing', { accountId: accountId, scriptName: cb.value });
+              if (res && res.success) okCount++; else failCount++;
+            }));
+          }
+          showNotification('开启完成：成功 ' + okCount + ' 个，失败 ' + failCount + ' 个');
+        }
+      } catch (e) {
+        showNotification('操作异常：' + (e.message || e), 'error');
+      }
+    }
+    window.batchEnableTracing = batchEnableTracing;
 
     window.toggleSelectAllPages = function(cb) {
       document.querySelectorAll('.pages-cb').forEach(function(c){ c.checked = cb.checked; });
