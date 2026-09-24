@@ -1,14 +1,13 @@
 /**
  * Cloudflare Worker: MyCF
- * 1. Cloudflare多账号管理系统，本版本为修改版，原作者： https://t.me/yifang_chat
+ * 1. Cloudflare多账号管理系统，本版本为二次开发版，原作者： https://t.me/yifang_chat
  * 2. 推荐workers部署。
  * 3. 推荐添加变量名称为大写的ACCESS_PASSWORD，建立访问密码。不设则不启用密码保护。
  * 4. 推荐建立任意名称KV空间。 绑定建立的KV空间，变量名为大写的CF_ACCOUNTS_KV，用来存储账号信息，不绑定则存储在本地浏览器。
  * 5. 绑定域名，访问域名，批量导入格式为：每行一个账号，格式：邮箱|GlobalApiKey。
  */
 
-
-// 支持批量创建workers,批量添加环境变量、kv、d1,是否开启workers分配的域名
+// 支持批量创建workers、pages，批量添加环境变量、kv、d1,是否开启workers分配的域名
 
 export default {
   async fetch(request, env, ctx) {
@@ -33,7 +32,6 @@ async function enableWorkerObservability(accountId, scriptName, email, key) {
   const settingsUrl = `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}/script-settings`;
   const authHeaders = { 'X-Auth-Email': email, 'X-Auth-Key': key };
   try {
-    // 先读取现有 script-settings（logpush / tail_consumers / tags），合并后再 PATCH，避免整体覆盖丢失
     let current = null;
     try {
       const g = await fetch(settingsUrl, { headers: authHeaders });
@@ -58,6 +56,45 @@ async function enableWorkerObservability(accountId, scriptName, email, key) {
     try { d = await r.json(); } catch (e) { d = null; }
     const ok = r.ok && (!d || d.success !== false);
     return { ok: ok, status: r.status, detail: d };
+  } catch (e) {
+    return { ok: false, status: 0, detail: { error: String((e && e.message) || e) } };
+  }
+}
+
+async function setWorkerSubdomain(accountId, scriptName, email, key, enabled, previewsEnabled) {
+  const url = `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}/subdomain`;
+  const body = { enabled: !!enabled };
+  if (previewsEnabled !== undefined && previewsEnabled !== null) body.previews_enabled = !!previewsEnabled;
+  const authHeaders = { 'X-Auth-Email': email, 'X-Auth-Key': key };
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: Object.assign({}, authHeaders, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body)
+    });
+    let d = null;
+    try { d = await r.json(); } catch (e) { d = null; }
+    const ok = r.ok && (!d || d.success !== false);
+    return { ok: ok, status: r.status, enabled: body.enabled, previewsEnabled: body.previews_enabled, detail: d };
+  } catch (e) {
+    return { ok: false, status: 0, enabled: body.enabled, detail: { error: String((e && e.message) || e) } };
+  }
+}
+
+async function disableWorkerPreviews(accountId, scriptName, email, key) {
+  const url = `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}/subdomain`;
+  const authHeaders = { 'X-Auth-Email': email, 'X-Auth-Key': key };
+  try {
+    let cur = null;
+    try {
+      const g = await fetch(url, { headers: authHeaders });
+      if (g.ok) { try { cur = await g.json(); } catch (e) { cur = null; } }
+    } catch (e) {}
+    if (cur && cur.success && cur.result && cur.result.previews_enabled === false) {
+      return { ok: true, status: 200, skipped: true, detail: cur };
+    }
+    const prodEnabled = (cur && cur.success && cur.result && typeof cur.result.enabled === 'boolean') ? cur.result.enabled : true;
+    return await setWorkerSubdomain(accountId, scriptName, email, key, prodEnabled, false);
   } catch (e) {
     return { ok: false, status: 0, detail: { error: String((e && e.message) || e) } };
   }
@@ -165,7 +202,7 @@ async function handleAPI(req, env) {
     'create-kv-namespace','delete-kv-namespace','put-kv-value','get-kv-value','delete-kv-value',
     'list-kv-keys','create-d1-database','delete-d1-database','execute-d1-query',
     'list-zones','create-zone','delete-zone','list-dns-records','create-dns-record','delete-dns-record',
-    'update-dns-record','toggle-worker-domain','get-worker-analytics','get-usage-today','enable-worker-tracing',
+    'update-dns-record','toggle-worker-domain','get-worker-analytics','get-usage-today','enable-worker-tracing','disable-worker-previews',
     'get-worker-domains','toggle-worker-subdomain','add-worker-domain', 'delete-worker-domain', 'get-worker-bindings','list-pages-projects','delete-pages-project','deploy-pages-direct','list-snippets','get-snippet','deploy-snippet','delete-snippet','list-snippet-rules','add-snippet-rule','delete-snippet-rule'
   ]);
 
@@ -210,7 +247,8 @@ async function handleAPI(req, env) {
               try {
                 const subdomainStatus = await cfGet(`/accounts/${payload.accountId}/workers/scripts/${worker.id}/subdomain`, payload.email, payload.key);
                 worker.subdomainEnabled = subdomainStatus.success ? subdomainStatus.result.enabled : true;
-              } catch (e) { worker.subdomainEnabled = true; }
+                worker.previewsEnabled = subdomainStatus.success ? (subdomainStatus.result.previews_enabled !== false) : true;
+              } catch (e) { worker.subdomainEnabled = true; worker.previewsEnabled = true; }
               
               if (workersSubdomain) {
                 worker.defaultDomain = {
@@ -255,10 +293,12 @@ async function handleAPI(req, env) {
         }
 
         let currentBindings = [];
+        let isExistingWorker = false;
         try {
           const bindingsRes = await cfGet(`/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}/bindings`, payload.email, payload.key);
           if (bindingsRes && bindingsRes.success) {
             currentBindings = bindingsRes.result;
+            isExistingWorker = true;
           }
         } catch (e) {}
 
@@ -351,8 +391,23 @@ async function handleAPI(req, env) {
 
         const obsRes = await enableWorkerObservability(accountId, scriptName, payload.email, payload.key);
 
-        return json({ success: true, message: 'Worker 部署成功' + (obsRes && obsRes.ok ? '（Workers 日志+跟踪已开启）' : '（警告：Workers 跟踪开启失败，可在 Workers 列表点「开启跟踪」补开）'),
-          upload: uploadRes, autoDowngraded: autoDowngraded, observability: obsRes });
+        let subdomainRes = null;
+        if (payload.keepSubdomain !== true) {
+          if (!isExistingWorker) {
+            subdomainRes = await setWorkerSubdomain(accountId, scriptName, payload.email, payload.key, true, false);
+          } else {
+            subdomainRes = await disableWorkerPreviews(accountId, scriptName, payload.email, payload.key);
+          }
+        }
+
+        let subMsg = '';
+        if (subdomainRes) {
+          if (subdomainRes.ok && subdomainRes.skipped) subMsg = '';
+          else if (subdomainRes.ok) subMsg = '（预览 URL 已关闭）';
+          else subMsg = '（警告：预览 URL 关闭失败）';
+        }
+        return json({ success: true, message: 'Worker 部署成功' + (obsRes && obsRes.ok ? '（Workers 日志+跟踪已开启）' : '（警告：Workers 跟踪开启失败，可在 Workers 列表点「开启跟踪」补开）') + subMsg,
+          upload: uploadRes, autoDowngraded: autoDowngraded, observability: obsRes, subdomain: subdomainRes });
       }
 
       case 'enable-worker-tracing': {
@@ -373,6 +428,26 @@ async function handleAPI(req, env) {
         if (!scriptName) return json({ success:false, error:'scriptName required' }, 400);
         const traceRes = await enableWorkerObservability(payload.accountId, scriptName, payload.email, payload.key);
         return json({ success: traceRes.ok, message: traceRes.ok ? 'Workers 日志 + 跟踪已开启' : '开启失败，详情见 observability 字段', observability: traceRes });
+      }
+
+      case 'disable-worker-previews': {
+        const { scriptName, applyToAll } = payload;
+        if (!payload.accountId) return json({ success:false, error:'accountId required' }, 400);
+        if (applyToAll) {
+          const listRes = await cfGet(`/accounts/${payload.accountId}/workers/scripts`, payload.email, payload.key);
+          if (!listRes.success || !Array.isArray(listRes.result)) return json({ success:false, error:'获取 Worker 列表失败: ' + ((listRes.errors && listRes.errors[0] && listRes.errors[0].message) || 'Unknown') });
+          const targets = listRes.result.map(w => w.id || w.name || w.script_name).filter(Boolean);
+          const results = [];
+          for (const targetName of targets) {
+            const r = await disableWorkerPreviews(payload.accountId, targetName, payload.email, payload.key);
+            results.push({ scriptName: targetName, ok: r.ok, status: r.status });
+          }
+          const okCount = results.filter(x => x.ok).length;
+          return json({ success: true, message: `已处理 ${targets.length} 个 Worker，成功关闭 ${okCount} 个预览 URL（生产域名不受影响）`, okCount: okCount, total: targets.length, results: results });
+        }
+        if (!scriptName) return json({ success:false, error:'scriptName required' }, 400);
+        const prevRes = await disableWorkerPreviews(payload.accountId, scriptName, payload.email, payload.key);
+        return json({ success: prevRes.ok, message: prevRes.ok ? (prevRes.skipped ? '预览 URL 已是关闭状态' : '预览 URL 已关闭（生产域名不受影响）') : '关闭失败，详情见 subdomain 字段', subdomain: prevRes });
       }
 
       case 'put-worker-variables': {
@@ -590,7 +665,6 @@ case 'deploy-pages-direct': {
 
   if (workerFile) {
     try {
-      // 在 Worker 环境中使用 fetch data URI 高效且安全地解码 base64
       const workerBlob = await fetch(`data:${workerFile.contentType};base64,${workerFile.base64}`).then(r => r.blob());
       form.append('_worker.js', workerBlob, '_worker.js');
     } catch(e) {
@@ -620,7 +694,24 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
 
       case 'get-workers-subdomain': return json(await cfGet(`/accounts/${payload.accountId}/workers/subdomain`, payload.email, payload.key));
       case 'put-workers-subdomain': return json({ success: true, data: await cfPutRaw(`/accounts/${payload.accountId}/workers/subdomain`, payload.email, payload.key, { subdomain: payload.subdomain }) });
-      case 'toggle-worker-subdomain': return json(await cfPost(`/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(payload.scriptName)}/subdomain`, payload.email, payload.key, { enabled: payload.enabled }));
+      case 'toggle-worker-subdomain': {
+        let subEnabled;
+        let subPreviews;
+        if (payload.previewsOnly === true) {
+          subPreviews = !!payload.enabled;
+          subEnabled = true;
+          try {
+            const cur = await cfGet(`/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(payload.scriptName)}/subdomain`, payload.email, payload.key);
+            if (cur && cur.success && cur.result && typeof cur.result.enabled === 'boolean') subEnabled = cur.result.enabled;
+          } catch (e) {}
+        } else {
+          subEnabled = !!payload.enabled;
+          subPreviews = (payload.previewsEnabled === undefined || payload.previewsEnabled === null) ? null : !!payload.previewsEnabled;
+        }
+        const subBody = { enabled: subEnabled };
+        if (subPreviews !== null) subBody.previews_enabled = subPreviews;
+        return json(await cfPost(`/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(payload.scriptName)}/subdomain`, payload.email, payload.key, subBody));
+      }
 
       case 'list-zones': return json(await cfGet('/zones', payload.email, payload.key));
       case 'create-zone': return json(await cfPost('/zones', payload.email, payload.key, { name: payload.name }));
@@ -1165,6 +1256,7 @@ input:checked + .slider:before{transform:translateX(16px)}
             <div style="display:flex; gap:8px; align-items:center;">
               <label style="font-size:12px; cursor:pointer;"><input type="checkbox" id="selectAllWorkers" onchange="toggleSelectAllWorkers(this)"> 全选</label>
               <button class="btn" onclick="batchEnableTracing()" title="为选中的 Worker 开启 Workers 日志+跟踪；未选中任何 Worker 时应用到当前账号全部">开启跟踪</button>
+              <button class="btn" onclick="batchDisableWorkerPreviews()" title="关闭选中的 Worker 的 workers.dev 预览 URL（生产域名不受影响）；未选中任何 Worker 时应用到当前账号全部">关闭预览</button>
               <button class="btn danger" onclick="batchDeleteWorkers()">批量删除</button>
             </div>
           </div>
@@ -1191,7 +1283,7 @@ input:checked + .slider:before{transform:translateX(16px)}
                     <input id="batchWorkerName" class="input" placeholder="例如: my-proxy-worker">
                     <div style="margin-top:12px">
                        <label class="small" style="display:flex;align-items:center;cursor:pointer">
-                          <input type="checkbox" id="batchEnableSubdomain" checked style="margin-right:8px"> 开启默认域名 (*.workers.dev)
+                          <input type="checkbox" id="batchEnableSubdomain" checked style="margin-right:8px"> 开启默认域名 (*.workers.dev，预览 URL 自动关闭)
                        </label>
                     </div>
                     <div style="margin-top:8px">
@@ -1817,6 +1909,7 @@ function renderStaticJS(env) {
     });
     document.getElementById('clearBtn').addEventListener('click', function(){ if(confirm('清除保存的账号？')){ localStorage.removeItem('cf_accounts'); renderSaved(); } });
 
+    // ===== 密码保护 + KV 账号同步 =====
     function saveAccounts(arr) {
       localStorage.setItem('cf_accounts', JSON.stringify(arr));
       fetch('/api', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ action:'save-accounts-kv', accounts: arr }) }).catch(()=>{});
@@ -1936,6 +2029,7 @@ function renderStaticJS(env) {
     };
     function appendBatchLog(msg, color='#e2e8f0') { const log = el('batchLog'); const span = document.createElement('div'); span.style.color = color; span.textContent = \`[\${new Date().toLocaleTimeString()}] \${msg}\`; log.appendChild(span); log.scrollTop = log.scrollHeight; }
     
+    // ==================== 自动解析 + 自定义脚本 ====================
     function parseScriptDeps(scriptContent, workerName) {
       var kvB=[], d1B=[], envV=[], seen={}, m;
       var reKv=new RegExp('env[.]([A-Za-z][A-Za-z0-9_]*)[.](?:get|put|delete|list|getWithMetadata)[ \t]*[(]','g');
@@ -1997,6 +2091,7 @@ function renderStaticJS(env) {
       showNotification(total>0?('解析完成 KV:'+d.kvB.length+' D1:'+d.d1B.length+' ENV:'+d.envV.length+(d.envV.length?'，请填写 ENV 值':'')):'未检测到依赖，可直接部署');
     }
 
+    // ===== GitHub URL 智能转换 =====
     var WORKER_FILENAMES = ['_worker.js', 'worker.js', 'index.js', 'src/worker.js', 'src/index.js'];
 
     function githubToRaw(ghUrl) {
@@ -2340,16 +2435,16 @@ function renderStaticJS(env) {
                     }
 
                     const enableSubdomain = el('batchEnableSubdomain').checked;
-                    appendBatchLog(\`   ↳ 设置子域名: \${enableSubdomain ? '开启' : '关闭'}\`, '#9ca3af');
-                    const toggleRes = await api('toggle-worker-subdomain', { ...creds, scriptName: name, enabled: enableSubdomain });
-                    
+                    if (deployRes.subdomain) { appendBatchLog('   ↳ workers.dev 预览 URL: ' + (deployRes.subdomain.ok ? (deployRes.subdomain.skipped ? '已是关闭状态' : '已关闭') : '关闭失败，请手动检查'), deployRes.subdomain.ok ? '#4ade80' : '#fbbf24'); }
                     if (enableSubdomain) {
+                        appendBatchLog('   ↳ 按选择开启 workers.dev 默认域名...', '#9ca3af');
+                        const toggleRes = await api('toggle-worker-subdomain', { ...creds, scriptName: name, enabled: true, previewsEnabled: false });
                         const subRes = await api('get-workers-subdomain', creds);
                         if (subRes.success && subRes.result.subdomain) {
-                            const fullUrl = \`https://\${name}.\${subRes.result.subdomain}.workers.dev\`;
-                            appendBatchLog(\`   🔗 \${fullUrl}\`, '#60a5fa');
+                            const fullUrl = 'https://' + name + '.' + subRes.result.subdomain + '.workers.dev';
+                            appendBatchLog('   🔗 ' + fullUrl, '#60a5fa');
                         } else {
-                            appendBatchLog(\`   ⚠️ 无法获取子域名信息，请确认账号已配置 Workers 子域名\`, '#fbbf24');
+                            appendBatchLog('   ⚠️ 无法获取子域名信息，请确认账号已配置 Workers 子域名', '#fbbf24');
                         }
                     }
 
@@ -2446,6 +2541,7 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
         const domains = w.domains || [];
         const bindings = w.bindings || [];
         const subdomainEnabled = w.subdomainEnabled !== false;
+        const previewsEnabled = w.previewsEnabled !== false;
         
         const envBindings = bindings.filter(b => b.type === 'plain_text' || b.type === 'secret_text');
         const kvBindings = bindings.filter(b => b.type === 'kv_namespace');
@@ -2473,6 +2569,19 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
                        <span class="slider"></span>
                      </label>
                      <span class="small" style="margin-left:8px">\${subdomainEnabled ? '已开启' : '已关闭'}</span>
+                  </div>
+                </div>
+                <div style="display:flex;align-items:center;gap:12px;margin-top:4px">
+                  <span class="domain-tag workers-dev" style="cursor:default">
+                    *.\${defaultDomain.hostname}
+                    <span class="domain-status \${previewsEnabled ? 'active' : 'inactive'}">\${previewsEnabled ? '已启用' : '已禁用'}</span>
+                  </span>
+                  <div class="domain-control" style="margin:0">
+                     <label class="switch">
+                       <input type="checkbox" \${previewsEnabled ? 'checked' : ''} onchange="toggleWorkerSubdomain('\${name}', this.checked, true)">
+                       <span class="slider"></span>
+                     </label>
+                     <span class="small" style="margin-left:8px">预览 URL</span>
                   </div>
                 </div>
               </div>
@@ -2533,7 +2642,7 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
       updateWorkerMetrics();
     }
 
-    async function toggleWorkerSubdomain(scriptName, enabled) { const accountId = localStorage.getItem('cf_accountId'); const res = await api('toggle-worker-subdomain', { accountId, scriptName, enabled }); if (res && res.success) { showNotification(enabled ? 'Workers 子域名已启用' : 'Workers 子域名已禁用'); setTimeout(refreshWorkers, 1000); } else { showNotification(res.error || '操作失败', 'error'); refreshWorkers(); } }
+    async function toggleWorkerSubdomain(scriptName, enabled, isPreview) { const accountId = localStorage.getItem('cf_accountId'); const req = { accountId, scriptName, enabled }; if (isPreview) req.previewsOnly = true; const res = await api('toggle-worker-subdomain', req); if (res && res.success) { showNotification(isPreview ? (enabled ? '预览 URL 已启用' : '预览 URL 已禁用') : (enabled ? 'Workers 子域名已启用' : 'Workers 子域名已禁用')); setTimeout(refreshWorkers, 1000); } else { showNotification(res.error || '操作失败', 'error'); refreshWorkers(); } }
     
     let currentWorkerForDomain = '';
     function openAddDomainModal(scriptName) { currentWorkerForDomain = scriptName; el('newDomainInput').value = ''; el('addDomainModal').style.display = 'flex'; }
@@ -2949,7 +3058,7 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
       if (!accountId) {
         const ar = await api('list-accounts');
         accountId = ar && ar.result && ar.result[0] && ar.result[0].id;
-        if (accountId) localStorage.setItem('cfaccountId', accountId);
+        if (accountId) localStorage.setItem('cf_accountId', accountId);
       }
       if (!accountId) return showNotification('无法获取 Account ID', 'error');
       showNotification(useAll ? '正在为全部 Worker 开启 日志+跟踪...' : '正在为 ' + checked.length + ' 个 Worker 开启 日志+跟踪...');
@@ -2975,6 +3084,43 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
       }
     }
     window.batchEnableTracing = batchEnableTracing;
+
+    async function batchDisableWorkerPreviews() {
+      const checked = Array.from(document.querySelectorAll('.worker-cb:checked'));
+      const useAll = checked.length === 0;
+      if (!useAll && !confirm('确定为选中的 ' + checked.length + ' 个 Worker 关闭 workers.dev 预览 URL（生产域名不受影响）吗？')) return;
+      if (useAll && !confirm('未选中任何 Worker，将为当前账号【全部】 Worker 关闭 workers.dev 预览 URL（生产域名不受影响），确定继续吗？')) return;
+      let accountId = localStorage.getItem('cf_accountId');
+      if (!accountId) {
+        const ar = await api('list-accounts');
+        accountId = ar && ar.result && ar.result[0] && ar.result[0].id;
+        if (accountId) localStorage.setItem('cf_accountId', accountId);
+      }
+      if (!accountId) return showNotification('无法获取 Account ID', 'error');
+      showNotification(useAll ? '正在为全部 Worker 关闭预览 URL...' : '正在为 ' + checked.length + ' 个 Worker 关闭预览 URL...');
+      try {
+        if (useAll) {
+          const res = await api('disable-worker-previews', { accountId: accountId, applyToAll: true });
+          if (res && res.success) { showNotification(res.message || '操作完成'); }
+          else showNotification((res && (res.error || res.message)) || '操作失败', 'error');
+        } else {
+          let okCount = 0, failCount = 0;
+          const chunks = [];
+          for (let i = 0; i < checked.length; i += 10) chunks.push(checked.slice(i, i + 10));
+          for (const chunk of chunks) {
+            await Promise.all(chunk.map(async (cb) => {
+              const res = await api('disable-worker-previews', { accountId: accountId, scriptName: cb.value });
+              if (res && res.success) okCount++; else failCount++;
+            }));
+          }
+          showNotification('关闭完成：成功 ' + okCount + ' 个，失败 ' + failCount + ' 个');
+        }
+        setTimeout(refreshWorkers, 800);
+      } catch (e) {
+        showNotification('操作异常：' + (e.message || e), 'error');
+      }
+    }
+    window.batchDisableWorkerPreviews = batchDisableWorkerPreviews;
 
     window.toggleSelectAllPages = function(cb) {
       document.querySelectorAll('.pages-cb').forEach(function(c){ c.checked = cb.checked; });
